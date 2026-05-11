@@ -225,68 +225,178 @@ def week_monday_str():
 
 
 # ── Quote fetching ────────────────────────────────────────────────────────────
-def _yf_info(ticker: str) -> dict:
-    """Try yfinance with curl_cffi session first (avoids Streamlit Cloud rate-limit),
-    then plain yfinance, then yfinance download as last resort."""
-    # Attempt 1: curl_cffi impersonation (best for cloud IPs)
+def _yahoo_chart_api(ticker: str) -> dict:
+    """
+    Direct Yahoo Finance v8 chart API — returns pre/post market prices.
+    Most reliable on cloud IPs; no rate-limit issues like .info endpoint.
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "interval": "1d", "range": "2d",
+        "includePrePost": "true",
+        "corsDomain": "finance.yahoo.com",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://finance.yahoo.com/",
+    }
     try:
         from curl_cffi import requests as curl_req
-        session = curl_req.Session(impersonate="chrome110")
-        t = yf.Ticker(ticker, session=session)
-        info = t.info
-        if info.get("regularMarketPrice") or info.get("previousClose"):
-            return info
+        resp = curl_req.get(url, params=params, headers=headers,
+                            impersonate="chrome110", timeout=10)
     except Exception:
-        pass
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
 
-    # Attempt 2: plain yfinance
+    data  = resp.json()
+    meta  = data["chart"]["result"][0]["meta"]
+    price = meta.get("regularMarketPrice") or meta.get("previousClose")
+    prev  = meta.get("chartPreviousClose") or meta.get("previousClose") or price
+
+    # Pre/post market from meta
+    pre_price  = meta.get("preMarketPrice")
+    post_price = meta.get("postMarketPrice")
+
+    def _chg_pct(p, base):
+        if p and base:
+            chg = p - base
+            pct = chg / base * 100
+            return chg, pct
+        return None, None
+
+    pre_chg,  pre_pct  = _chg_pct(pre_price,  prev)
+    post_chg, post_pct = _chg_pct(post_price, price)
+    reg_chg,  reg_pct  = _chg_pct(price, prev)
+
+    # Day high/low from indicators if available
     try:
-        info = yf.Ticker(ticker).info
-        if info.get("regularMarketPrice") or info.get("previousClose"):
-            return info
+        ind   = data["chart"]["result"][0]["indicators"]["quote"][0]
+        highs = [x for x in (ind.get("high") or []) if x]
+        lows  = [x for x in (ind.get("low")  or []) if x]
+        vols  = [x for x in (ind.get("volume") or []) if x]
+        day_high = highs[-1] if highs else None
+        day_low  = lows[-1]  if lows  else None
+        volume   = int(vols[-1]) if vols else None
     except Exception:
-        pass
+        day_high = day_low = volume = None
 
-    # Attempt 3: yfinance download → extract last close
-    try:
-        df = yf.download(ticker, period="2d", interval="1d", progress=False, auto_adjust=True)
-        if not df.empty:
-            cls = df["Close"]
-            if hasattr(cls, "iloc"):
-                price = float(cls.iloc[-1].item() if hasattr(cls.iloc[-1], "item") else cls.iloc[-1])
-                prev  = float(cls.iloc[-2].item() if len(cls) > 1 and hasattr(cls.iloc[-2], "item") else cls.iloc[-2]) if len(cls) > 1 else price
-                return {"regularMarketPrice": price, "previousClose": prev,
-                        "shortName": ticker, "currentPrice": price}
-    except Exception:
-        pass
+    return dict(
+        ticker    = ticker,
+        name      = meta.get("longName") or meta.get("shortName") or ticker,
+        price     = price,
+        prev      = prev,
+        reg_chg   = reg_chg,   reg_pct   = reg_pct,
+        pre_price = pre_price, pre_chg   = pre_chg,  pre_pct  = pre_pct,
+        post_price= post_price,post_chg  = post_chg, post_pct = post_pct,
+        high      = day_high,  low       = day_low,
+        volume    = volume,    avg_vol   = None,
+        cap       = None,      error     = None,
+    )
 
-    raise RuntimeError("All yfinance methods failed")
+
+def _yf_download_fallback(ticker: str) -> dict:
+    """Last-resort: yf.download with prepost=True to get pre/post prices."""
+    df = yf.download(ticker, period="5d", interval="1m",
+                     prepost=True, progress=False, auto_adjust=True)
+    if df.empty:
+        raise RuntimeError("download returned empty")
+
+    # Flatten MultiIndex if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    et      = pytz.timezone("America/New_York")
+    now_et  = datetime.now(et)
+    today   = now_et.date()
+    t_now   = now_et.time()
+
+    # Filter to today
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(et)
+    else:
+        df.index = df.index.tz_convert(et)
+
+    today_df = df[df.index.date == today]
+    pre_df   = today_df[today_df.index.time < time(9, 30)]
+    reg_df   = today_df[(today_df.index.time >= time(9, 30)) & (today_df.index.time < time(16, 0))]
+    post_df  = today_df[today_df.index.time >= time(16, 0)]
+    prev_df  = df[df.index.date < today]
+
+    def _last(d, col="Close"):
+        return float(d[col].iloc[-1]) if not d.empty and col in d.columns else None
+
+    prev_close = _last(prev_df)
+    reg_price  = _last(reg_df) or _last(today_df)
+    pre_price  = _last(pre_df)
+    post_price = _last(post_df)
+
+    def _cp(p, base):
+        if p and base: return p - base, (p - base) / base * 100
+        return None, None
+
+    pre_chg,  pre_pct  = _cp(pre_price,  prev_close)
+    post_chg, post_pct = _cp(post_price, reg_price or prev_close)
+    reg_chg,  reg_pct  = _cp(reg_price,  prev_close)
+
+    return dict(
+        ticker    = ticker, name = ticker,
+        price     = reg_price or prev_close,
+        prev      = prev_close,
+        reg_chg   = reg_chg,   reg_pct   = reg_pct,
+        pre_price = pre_price, pre_chg   = pre_chg,  pre_pct  = pre_pct,
+        post_price= post_price,post_chg  = post_chg, post_pct = post_pct,
+        high=None, low=None, volume=None, avg_vol=None, cap=None, error=None,
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_quote(ticker: str) -> dict:
+    # Skip pre/post endpoints for futures (always regular market)
+    is_future = ticker.endswith("=F") or ticker.startswith("^")
+
+    # Layer 1: Yahoo chart API (handles pre/post, cloud-friendly)
     try:
-        info = _yf_info(ticker)
-        price     = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
-        prev      = info.get("previousClose") or info.get("regularMarketPreviousClose")
-        pre_price = info.get("preMarketPrice")
-        pre_chg   = info.get("preMarketChange")
-        pre_pct   = info.get("preMarketChangePercent")
-        post_price= info.get("postMarketPrice")
-        post_chg  = info.get("postMarketChange")
-        post_pct  = info.get("postMarketChangePercent")
-        if pre_pct  and abs(pre_pct)  < 1: pre_pct  *= 100
-        if post_pct and abs(post_pct) < 1: post_pct *= 100
-        reg_chg = (price - prev) if (price and prev) else None
-        reg_pct = (reg_chg / prev * 100) if (reg_chg and prev) else None
-        return dict(ticker=ticker, name=info.get("shortName") or info.get("longName") or ticker,
-                    price=price, prev=prev, reg_chg=reg_chg, reg_pct=reg_pct,
-                    pre_price=pre_price, pre_chg=pre_chg, pre_pct=pre_pct,
-                    post_price=post_price, post_chg=post_chg, post_pct=post_pct,
-                    high=info.get("dayHigh") or info.get("regularMarketDayHigh"),
-                    low=info.get("dayLow")   or info.get("regularMarketDayLow"),
-                    volume=info.get("volume") or info.get("regularMarketVolume"),
-                    avg_vol=info.get("averageVolume"), cap=info.get("marketCap"), error=None)
+        return _yahoo_chart_api(ticker)
+    except Exception:
+        pass
+
+    # Layer 2: curl_cffi + yfinance .info
+    if not is_future:
+        try:
+            from curl_cffi import requests as curl_req
+            session = curl_req.Session(impersonate="chrome110")
+            t    = yf.Ticker(ticker, session=session)
+            info = t.info
+            if info.get("regularMarketPrice") or info.get("previousClose"):
+                price     = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+                prev      = info.get("previousClose") or price
+                pre_price = info.get("preMarketPrice")
+                pre_chg   = info.get("preMarketChange")
+                pre_pct   = info.get("preMarketChangePercent")
+                post_price= info.get("postMarketPrice")
+                post_chg  = info.get("postMarketChange")
+                post_pct  = info.get("postMarketChangePercent")
+                if pre_pct  and abs(pre_pct)  < 1: pre_pct  *= 100
+                if post_pct and abs(post_pct) < 1: post_pct *= 100
+                reg_chg = (price - prev) if (price and prev) else None
+                reg_pct = (reg_chg / prev * 100) if (reg_chg and prev) else None
+                return dict(ticker=ticker,
+                            name=info.get("shortName") or info.get("longName") or ticker,
+                            price=price, prev=prev, reg_chg=reg_chg, reg_pct=reg_pct,
+                            pre_price=pre_price, pre_chg=pre_chg, pre_pct=pre_pct,
+                            post_price=post_price, post_chg=post_chg, post_pct=post_pct,
+                            high=info.get("dayHigh"), low=info.get("dayLow"),
+                            volume=info.get("volume"), avg_vol=info.get("averageVolume"),
+                            cap=info.get("marketCap"), error=None)
+        except Exception:
+            pass
+
+    # Layer 3: yf.download with prepost=True (1-min bars)
+    try:
+        return _yf_download_fallback(ticker)
     except Exception as e:
         return dict(ticker=ticker, error=str(e))
 
