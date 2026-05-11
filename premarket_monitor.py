@@ -309,8 +309,13 @@ def _yahoo_chart_api(ticker: str) -> dict:
         day_low  = min(reg_lows)  if reg_lows  else None
         volume   = sum(reg_vols)  if reg_vols  else None
 
+
+        # Estimate avg_vol: extrapolate current pace to full 390-min session
+        reg_bar_count = len(reg_vols) if reg_vols else 0
+        frac = reg_bar_count / 390.0
+        avg_vol = int(volume / frac) if (volume and frac > 0.05) else None
     except Exception:
-        day_high = day_low = volume = None
+        day_high = day_low = volume = avg_vol = None
 
     def _cp(p, base):
         if p and base:
@@ -329,7 +334,7 @@ def _yahoo_chart_api(ticker: str) -> dict:
         pre_price = pre_price, pre_chg   = pre_chg,  pre_pct  = pre_pct,
         post_price= post_price,post_chg  = post_chg, post_pct = post_pct,
         high      = day_high,  low       = day_low,
-        volume    = volume,    avg_vol   = None,
+        volume    = volume,    avg_vol   = avg_vol,
         cap       = None,      error     = None,
     )
 
@@ -495,12 +500,18 @@ def render_quote_card(data, is_pre, is_post):
     reg_pct  = data.get("reg_pct")
     isFut    = data["ticker"].endswith("=F")
 
+    et_now = datetime.now(pytz.timezone("America/New_York"))
+    t_now  = et_now.time()
+    is_regular = time(9, 30) <= t_now < time(16, 0)
+
     if is_pre and pm_price:
         dp, dc, dpct, lbl = pm_price, pm_chg, pm_pct, "盤前"
     elif is_post and ah_price:
         dp, dc, dpct, lbl = ah_price, ah_chg, ah_pct, "盤後"
+    elif is_regular or isFut:
+        dp, dc, dpct, lbl = reg_price, reg_chg, reg_pct, "盤中" if is_regular else "即時"
     else:
-        dp, dc, dpct, lbl = reg_price, reg_chg, reg_pct, ("即時" if isFut else "收盤")
+        dp, dc, dpct, lbl = reg_price, reg_chg, reg_pct, "收盤"
 
     sign    = "+" if (dc or 0) >= 0 else ""
     chg_str = f"{sign}{fmt_num(dc)} ({fmt_pct(dpct)})" if dc is not None else "—"
@@ -1247,13 +1258,17 @@ def main():
         """Return (pct, price, label) using best available session data."""
         if not d or d.get("error"):
             return None, None, "—"
-        if d.get("pre_pct") is not None:
+        et_t = datetime.now(pytz.timezone("America/New_York")).time()
+        _is_reg = time(9, 30) <= et_t < time(16, 0)
+        if d.get("pre_pct") is not None and not _is_reg:
             return d["pre_pct"], d.get("pre_price") or d.get("price"), "盤前"
         if d.get("reg_pct") is not None:
-            return d["reg_pct"], d.get("price"), "收盤"
+            return d["reg_pct"], d.get("price"), "盤中" if _is_reg else "收盤"
+        if d.get("pre_pct") is not None:
+            return d["pre_pct"], d.get("pre_price") or d.get("price"), "盤前"
         if d.get("post_pct") is not None:
             return d["post_pct"], d.get("post_price"), "盤後"
-        return None, d.get("price"), "收盤"
+        return None, d.get("price"), "—"
 
     vp = vd.get("price")
     vc = "down" if (vp and vp>25) else ("up" if (vp and vp<18) else "flat")
