@@ -256,8 +256,30 @@ def _yahoo_chart_api(ticker: str) -> dict:
     prev  = meta.get("chartPreviousClose") or meta.get("previousClose") or price
 
     # Pre/post market from meta
+    # Yahoo v8 chart meta sometimes omits preMarketPrice during regular hours.
+    # Fall back to v7 quote API which always includes it when available.
     pre_price  = meta.get("preMarketPrice")
     post_price = meta.get("postMarketPrice")
+
+    if pre_price is None and not (ticker.endswith("=F") or ticker.startswith("^")):
+        try:
+            q_url = "https://query1.finance.yahoo.com/v7/finance/quote"
+            q_hdrs = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.yahoo.com/"}
+            q_params = {"symbols": ticker, "fields": "preMarketPrice,postMarketPrice,preMarketChange,preMarketChangePercent,postMarketChange,postMarketChangePercent"}
+            try:
+                from curl_cffi import requests as curl_req
+                qr = curl_req.get(q_url, params=q_params, headers=q_hdrs, impersonate="chrome110", timeout=8)
+            except Exception:
+                qr = requests.get(q_url, params=q_params, headers=q_hdrs, timeout=8)
+            qdata = qr.json()["quoteResponse"]["result"]
+            if qdata:
+                q = qdata[0]
+                pre_price  = q.get("preMarketPrice")  or pre_price
+                post_price = q.get("postMarketPrice") or post_price
+                if pre_price and not pre_price:
+                    pre_price = None
+        except Exception:
+            pass
 
     def _chg_pct(p, base):
         if p and base:
@@ -267,7 +289,7 @@ def _yahoo_chart_api(ticker: str) -> dict:
         return None, None
 
     pre_chg,  pre_pct  = _chg_pct(pre_price,  prev)
-    post_chg, post_pct = _chg_pct(post_price, price)
+    post_chg, post_pct = _chg_pct(post_price, price or prev)
     reg_chg,  reg_pct  = _chg_pct(price, prev)
 
     # Day high/low from indicators if available
@@ -402,52 +424,73 @@ def fetch_quote(ticker: str) -> dict:
 
 def render_quote_card(data, is_pre, is_post):
     if data.get("error"):
-        st.markdown(f'<div class="quote-card"><div class="quote-ticker">{data["ticker"]}</div>'
-                    f'<div class="quote-name" style="color:var(--down)">載入失敗</div></div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="quote-card">' +
+            f'<div class="quote-ticker">{data["ticker"]}</div>' +
+            '<div class="quote-name" style="color:var(--down)">載入失敗</div></div>',
+            unsafe_allow_html=True)
         return
-    pm_price, pm_chg, pm_pct = data.get("pre_price"), data.get("pre_chg"), data.get("pre_pct")
-    ah_price, ah_chg, ah_pct = data.get("post_price"), data.get("post_chg"), data.get("post_pct")
-    reg_price, reg_chg, reg_pct = data.get("price"), data.get("reg_chg"), data.get("reg_pct")
-    isFut = data["ticker"].endswith("=F")
+
+    pm_price = data.get("pre_price")
+    pm_chg   = data.get("pre_chg")
+    pm_pct   = data.get("pre_pct")
+    ah_price = data.get("post_price")
+    ah_chg   = data.get("post_chg")
+    ah_pct   = data.get("post_pct")
+    reg_price= data.get("price")
+    reg_chg  = data.get("reg_chg")
+    reg_pct  = data.get("reg_pct")
+    isFut    = data["ticker"].endswith("=F")
+
     if is_pre and pm_price:
-        dp,dc,dpct,lbl = pm_price, pm_chg, pm_pct, "盤前"
+        dp, dc, dpct, lbl = pm_price, pm_chg, pm_pct, "盤前"
     elif is_post and ah_price:
-        dp,dc,dpct,lbl = ah_price, ah_chg, ah_pct, "盤後"
+        dp, dc, dpct, lbl = ah_price, ah_chg, ah_pct, "盤後"
     else:
-        dp,dc,dpct,lbl = reg_price, reg_chg, reg_pct, ("即時" if isFut else "收盤")
-    sign = "+" if (dc or 0) >= 0 else ""
+        dp, dc, dpct, lbl = reg_price, reg_chg, reg_pct, ("即時" if isFut else "收盤")
+
+    sign    = "+" if (dc or 0) >= 0 else ""
     chg_str = f"{sign}{fmt_num(dc)} ({fmt_pct(dpct)})" if dc is not None else "—"
-    vol, avg = data.get("volume"), data.get("avg_vol")
+
+    vol, avg  = data.get("volume"), data.get("avg_vol")
     vol_ratio = f"{vol/avg:.1f}x" if (vol and avg) else "—"
-    vol_col = ("color:var(--down)" if (vol and avg and vol/avg > 1.5)
-               else ("color:var(--up)" if (vol and avg and vol/avg > 1.0) else ""))
-    pm_span = f"<span>盤前 <b class='up'>{fmt_num(pm_price)}</b></span>" if pm_price else ""
-    ah_span = f"<span>盤後 <b>{fmt_num(ah_price)}</b></span>" if ah_price else ""
-    st.markdown(f"""
-    <div class="quote-card">
-      <div class="quote-top">
-        <div>
-          <div class="quote-ticker">{data['ticker']}
-            <span class="pill {pc(dpct)}" style="font-size:.58rem;margin-left:.35rem">{lbl}</span>
-          </div>
-          <div class="quote-name">{data['name']}</div>
-        </div>
-        <div>
-          <div class="quote-price {cc(dpct)}">{fmt_num(dp)}</div>
-          <div class="quote-change {cc(dpct)}">{chg_str}</div>
-        </div>
-      </div>
-      <div class="quote-meta">
-        <span>收盤 <b>{fmt_num(reg_price)}</b></span>
-        {pm_span}{ah_span}
-        <span>高 <b>{fmt_num(data.get('high'))}</b></span>
-        <span>低 <b>{fmt_num(data.get('low'))}</b></span>
-        <span>量 <b style="{vol_col}">{fmt_vol(vol)}</b></span>
-        <span>量比 <b style="{vol_col}">{vol_ratio}</b></span>
-        <span>市值 <b>{fmt_cap(data.get('cap'))}</b></span>
-      </div>
-    </div>""", unsafe_allow_html=True)
+    # Use CSS class instead of inline style to avoid Streamlit escaping
+    if vol and avg and vol / avg > 1.5:
+        vol_cls = "down"
+    elif vol and avg and vol / avg > 1.0:
+        vol_cls = "up"
+    else:
+        vol_cls = "flat"
+
+    # Build meta spans as a single string — no f-string interpolation inside markdown
+    meta_parts = [f'<span>收盤 <b>{fmt_num(reg_price)}</b></span>']
+    if pm_price:
+        meta_parts.append(f'<span>盤前 <b class="up">{fmt_num(pm_price)}</b></span>')
+    if ah_price:
+        meta_parts.append(f'<span>盤後 <b>{fmt_num(ah_price)}</b></span>')
+    meta_parts.append(f'<span>高 <b>{fmt_num(data.get("high"))}</b></span>')
+    meta_parts.append(f'<span>低 <b>{fmt_num(data.get("low"))}</b></span>')
+    meta_parts.append(f'<span>量 <b class="{vol_cls}">{fmt_vol(vol)}</b></span>')
+    meta_parts.append(f'<span>量比 <b class="{vol_cls}">{vol_ratio}</b></span>')
+    meta_parts.append(f'<span>市值 <b>{fmt_cap(data.get("cap"))}</b></span>')
+    meta_html = " ".join(meta_parts)
+
+    html = (
+        '<div class="quote-card">' +
+        '<div class="quote-top">' +
+        '<div>' +
+        f'<div class="quote-ticker">{data["ticker"]} ' +
+        f'<span class="pill {pc(dpct)}" style="font-size:.58rem;margin-left:.35rem">{lbl}</span></div>' +
+        f'<div class="quote-name">{data["name"]}</div>' +
+        '</div>' +
+        '<div>' +
+        f'<div class="quote-price {cc(dpct)}">{fmt_num(dp)}</div>' +
+        f'<div class="quote-change {cc(dpct)}">{chg_str}</div>' +
+        '</div></div>' +
+        f'<div class="quote-meta">{meta_html}</div>' +
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ── Groq AI call ──────────────────────────────────────────────────────────────
