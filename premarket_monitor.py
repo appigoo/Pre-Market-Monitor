@@ -853,39 +853,65 @@ def generate_trading_prompt(events: list, oil_data: dict,
          for e in today_events]
     ) or "  （今日無已知重大事件）"
 
-    # Market snapshot
-    def snap(d, is_pre):
+    # Market snapshot — smart: show pre > reg > prev in that priority
+    def snap(d):
         if not d or d.get("error"): return "N/A"
-        p   = d.get("pre_price") if is_pre else d.get("price")
-        pct = d.get("pre_pct")   if is_pre else d.get("reg_pct")
-        return f"{fmt_num(p)} ({fmt_pct(pct)})"
+        # Pick best available price + pct
+        if d.get("pre_price") and d.get("pre_pct") is not None:
+            p, pct, tag = d["pre_price"], d["pre_pct"], "盤前"
+        elif d.get("post_price") and d.get("post_pct") is not None:
+            p, pct, tag = d["post_price"], d["post_pct"], "盤後"
+        elif d.get("price") and d.get("reg_pct") is not None:
+            p, pct, tag = d["price"], d["reg_pct"], "收盤"
+        else:
+            p   = d.get("price") or d.get("prev")
+            pct = None
+            tag = "收盤"
+        pct_str = fmt_pct(pct) if pct is not None else "—"
+        return f"{fmt_num(p)} {pct_str} [{tag}]"
 
-    wti   = oil_data.get("CL=F", {})
-    brent = oil_data.get("BZ=F", {})
+    wti   = oil_data.get("CL=F", {}) if oil_data else {}
+    brent = oil_data.get("BZ=F", {}) if oil_data else {}
 
-    prompt = f"""# 美股盤前分析請求
+    # Today high-impact events for prompt
+    high_events = [e for e in today_events if e.get("impact") == "high"]
+    high_lines = "
+".join(
+        [f"  ⚠️ {e['text']} — {e.get('note','')}" for e in high_events]
+    ) or "  （今日無已確認高影響事件）"
+
+    tsla_snap = snap(tsla_data) if tsla_data else "N/A"
+    qqq_snap  = snap(qqq_data)  if qqq_data  else "N/A"
+    vix_val   = fmt_num(vix_data.get("price")) if vix_data and not vix_data.get("error") else "N/A"
+    wti_str   = f"${fmt_num(wti.get('price'))} ({fmt_pct(wti.get('pct'))})" if wti.get("price") else "N/A"
+    brent_str = f"${fmt_num(brent.get('price'))} ({fmt_pct(brent.get('pct'))})" if brent.get("price") else "N/A"
+
+    prompt = f"""# 美股即時分析請求
 日期：{today_str}  時間：{time_str}  時段：{session}
 
-## 今日宏觀事件
+## 今日全部宏觀事件
 {events_lines}
+
+## 今日高影響事件（重點）
+{high_lines}
 
 ## 市場即時快照
 | 指標 | 數值 |
 |------|------|
-| TSLA | {snap(tsla_data, is_pre)} |
-| QQQ  | {snap(qqq_data, is_pre)} |
-| VIX  | {fmt_num(vix_data.get('price') if vix_data else None)} |
-| WTI 原油 | ${fmt_num(wti.get('price'))} ({fmt_pct(wti.get('pct'))}) |
-| Brent   | ${fmt_num(brent.get('price'))} ({fmt_pct(brent.get('pct'))}) |
+| TSLA | {tsla_snap} |
+| QQQ  | {qqq_snap} |
+| VIX  | {vix_val} |
+| WTI 原油 | {wti_str} |
+| Brent 原油 | {brent_str} |
 
 ## 請幫我分析：
-1. **今日最大風險因素**是什麼？對 TSLA/納指的方向影響？
-2. **油價走勢**對今日科技股有何影響？
-3. 根據以上數據，**TSLA 今日交易策略**建議（入場區間、止損位、目標位）？
-4. **VIX 水平**顯示市場情緒如何？是否適合做多？
-5. 今日需要密切關注的**關鍵時間點**（數據公布/官員講話）？
+1. **今日最大風險/機會**是什麼？對 TSLA 和納指方向的影響？
+2. **油價急升 {wti_str}** 對今日科技股有何具體影響？
+3. **TSLA 今日交易策略**：建議入場區間、止損位、目標位（$數字）？
+4. **VIX {vix_val}** 顯示市場情緒如何？適合做多/做空/觀望？
+5. 今日最需要關注的**時間點**（數據發布/官員講話/峰會消息）？
 
-請用繁體中文回答，盡量具體，包含數字區間。"""
+請用繁體中文回答，要具體，每點包含數字區間。"""
     return prompt
 
 
