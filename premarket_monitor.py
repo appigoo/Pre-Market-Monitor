@@ -810,35 +810,110 @@ def render_oil_panel():
 
 
 # ── News intel panel (Groq) ───────────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_news(query: str, serper_key: str, num: int = 6) -> list:
+def _today_et_str() -> str:
+    return datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+
+@st.cache_data(ttl=180, show_spinner=False)   # 3-min cache (was 5-min)
+def fetch_news(query: str, serper_key: str, num: int = 8) -> list:
+    """Fetch news with today's date appended to query, filter stale articles."""
     if not serper_key: return []
+    today = _today_et_str()
+    # Append today's date to bias Serper toward today's results
+    dated_query = f"{query} {today}"
     try:
         r = requests.post("https://google.serper.dev/news",
             headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-            json={"q": query, "num": num, "hl": "en", "gl": "us"}, timeout=8)
-        return r.json().get("news", [])
+            json={"q": dated_query, "num": num, "hl": "en", "gl": "us",
+                  "tbs": "qdr:d"},   # tbs=qdr:d = past 24 hours filter
+            timeout=8)
+        articles = r.json().get("news", [])
+
+        # Filter: keep only articles from today or yesterday (recency guard)
+        from datetime import timedelta
+        et     = pytz.timezone("America/New_York")
+        now_et = datetime.now(et)
+        cutoff = (now_et - timedelta(hours=36)).strftime("%Y-%m-%d")
+
+        fresh = []
+        stale = []
+        for a in articles:
+            date_str = a.get("date", "")
+            # Serper returns relative dates like "3 hours ago", "1 day ago"
+            # or absolute like "May 11, 2026" — treat missing/old as stale
+            is_fresh = (
+                "hour" in date_str or
+                "minute" in date_str or
+                "just now" in date_str.lower() or
+                today in date_str or
+                date_str == ""  # unknown date — include with warning
+            )
+            if is_fresh:
+                a["_fresh"] = True
+                fresh.append(a)
+            else:
+                a["_fresh"] = False
+                stale.append(a)
+
+        # Return fresh first; if fewer than 3 fresh, pad with stale
+        result = fresh + stale
+        return result[:6]
     except Exception:
         return []
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def groq_news_summary(articles: list, topic: str, groq_key: str) -> dict:
     if not articles or not groq_key:
-        return {"summary":"","signal":"neutral","signal_reason":"","bullets":[],"tsla_impact":""}
-    block = "\n\n".join([f"標題：{a.get('title','')}\n來源：{a.get('source','')}\n{a.get('snippet','')}"
-                         for a in articles[:6]])
-    prompt = f"""你是美股交易員分析師。分析「{topic}」相關最新新聞，用繁體中文輸出純 JSON（無其他文字）：
-新聞：
+        return {"summary":"","signal":"neutral","signal_reason":"","bullets":[],"tsla_impact":"","stale_warning":False}
+    
+    today = _today_et_str()
+    
+    # Tag each article with freshness for Groq context
+    tagged = []
+    stale_count = 0
+    for a in articles[:6]:
+        fresh_tag = "🟢 今日" if a.get("_fresh", True) else "🔴 舊聞"
+        if not a.get("_fresh", True):
+            stale_count += 1
+        tagged.append(
+            f"[{fresh_tag}] 標題：{a.get('title','')}\n"
+            f"來源：{a.get('source','')} | 時間：{a.get('date','未知')}\n"
+            f"內容：{a.get('snippet','')}"
+        )
+    block = "\n\n".join(tagged)
+    has_stale = stale_count > len(articles[:6]) // 2  # majority stale
+
+    prompt = f"""你是美股即時交易員分析師。今日日期：{today}（美東時間）
+
+分析以下「{topic}」新聞，**只根據標記為🟢今日的新聞**生成摘要。
+若所有新聞都是🔴舊聞，請在 summary 開頭明確說明「⚠️ 未找到今日最新消息，以下為近期背景資訊」。
+
+新聞（已按新舊標記）：
 {block}
 
-JSON 格式：
-{{"signal":"bullish|bearish|neutral","signal_reason":"一句話15字內","summary":"2-3句市場影響摘要","bullets":[{{"text":"重點含數字","level":"red|amber|green"}},{{"text":"重點2","level":"red|amber|green"}},{{"text":"重點3","level":"red|amber|green"}}],"tsla_impact":"對TSLA具體影響一句"}}"""
+輸出純 JSON（無其他文字、無 markdown）：
+{{
+  "signal": "bullish|bearish|neutral",
+  "signal_reason": "一句話15字內，必須基於今日消息",
+  "news_date": "最新消息的日期（如：May 11, 2026）",
+  "summary": "2-3句摘要，若有舊聞混入需明確標注",
+  "bullets": [
+    {{"text": "重點1（含具體數字，標明來源日期）", "level": "red|amber|green"}},
+    {{"text": "重點2", "level": "red|amber|green"}},
+    {{"text": "重點3", "level": "red|amber|green"}}
+  ],
+  "tsla_impact": "對TSLA今日具體影響一句（含方向和幅度估計）",
+  "stale_warning": {str(has_stale).lower()}
+}}"""
+
     try:
-        raw = groq_chat(prompt, groq_key, max_tokens=800, temperature=0.3)
+        raw = groq_chat(prompt, groq_key, max_tokens=900, temperature=0.2)
         raw = raw.replace("```json","").replace("```","").strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        result["stale_warning"] = result.get("stale_warning", has_stale)
+        return result
     except Exception:
-        return {"summary":"AI 摘要失敗","signal":"neutral","signal_reason":"","bullets":[],"tsla_impact":""}
+        return {"summary":"AI 摘要失敗","signal":"neutral","signal_reason":"",
+                "bullets":[],"tsla_impact":"","stale_warning":False,"news_date":""}
 
 def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, icon: str = "📡"):
     st.markdown(f'<div class="section-label">▸ {icon} {title}</div>', unsafe_allow_html=True)
@@ -856,30 +931,71 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
     if groq_key:
         with st.spinner("Groq 分析中..."):
             ai = groq_news_summary(articles, title, groq_key)
-    signal     = ai.get("signal","neutral")
-    sig_reason = ai.get("signal_reason","")
-    summary    = ai.get("summary","")
-    bullets    = ai.get("bullets",[])
-    tsla_imp   = ai.get("tsla_impact","")
+
+    signal       = ai.get("signal","neutral")
+    sig_reason   = ai.get("signal_reason","")
+    summary      = ai.get("summary","")
+    bullets      = ai.get("bullets",[])
+    tsla_imp     = ai.get("tsla_impact","")
+    news_date    = ai.get("news_date","")
+    stale_warn   = ai.get("stale_warning", False)
     sig_cls  = {"bullish":"signal-bullish","bearish":"signal-bearish"}.get(signal,"signal-neutral")
     sig_text = {"bullish":"▲ 利多","bearish":"▼ 利空","neutral":"◆ 中性"}.get(signal,"◆ 中性")
-    now_str = datetime.now().strftime("%H:%M")
+    now_str  = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+    today    = _today_et_str()
 
-    html = f"""<div class="intel-panel">
-      <div class="intel-header">
-        <div class="intel-title">{title}<span class="signal-badge {sig_cls}">{sig_text} {sig_reason}</span></div>
-        <div class="intel-time">Groq · {now_str}</div>
-      </div>"""
-    if summary: html += f'<div class="intel-summary">{summary}</div>'
+    # Count fresh vs stale articles
+    fresh_count = sum(1 for a in articles if a.get("_fresh", True))
+    total_count = len(articles)
+
+    html = '<div class="intel-panel">'
+    html += f'<div class="intel-header">'
+    html += f'<div class="intel-title">{title}<span class="signal-badge {sig_cls}">{sig_text} {sig_reason}</span></div>'
+    
+    # Freshness indicator
+    if fresh_count == total_count:
+        freshness = f'<span style="color:var(--up);font-size:.6rem">● 全部今日</span>'
+    elif fresh_count == 0:
+        freshness = f'<span style="color:var(--down);font-size:.6rem">⚠ 無今日消息</span>'
+    else:
+        freshness = f'<span style="color:#D4A017;font-size:.6rem">◑ {fresh_count}/{total_count} 今日</span>'
+    html += f'<div class="intel-time">{freshness} &nbsp;Groq · {now_str}</div>'
+    html += '</div>'
+
+    # Stale warning banner
+    if stale_warn or fresh_count == 0:
+        html += ('<div style="background:#FFF3CD;border-left:3px solid #D4A017;border-radius:0 4px 4px 0;'
+                 'padding:.4rem .8rem;font-size:.72rem;color:#856404;margin-bottom:.6rem">'
+                 f'⚠️ 未找到 {today} 的最新消息，以下為近期背景資訊，請自行核實最新發展</div>')
+
+    if summary:
+        html += f'<div class="intel-summary">{summary}</div>'
+
     if bullets:
         for b in bullets:
             dc = {"red":"red","amber":"amber"}.get(b.get("level",""),"")
-            html += f'<div class="news-item"><div class="news-dot {dc}"></div><div><div class="news-text">{b.get("text","")}</div></div></div>'
-    else:
-        for a in articles[:4]:
-            html += f'<div class="news-item"><div class="news-dot"></div><div><div class="news-text">{a.get("title","")}</div><div class="news-source">{a.get("source","")} · {a.get("date","")}</div></div></div>'
+            html += (f'<div class="news-item"><div class="news-dot {dc}"></div>'
+                     f'<div><div class="news-text">{b.get("text","")}</div></div></div>')
+    
+    # Always show raw article headlines with date tags
+    html += '<div style="margin-top:.6rem;padding-top:.5rem;border-top:1px solid var(--border)">'
+    for a in articles[:5]:
+        is_fresh = a.get("_fresh", True)
+        dot_col  = "var(--up)" if is_fresh else "var(--down)"
+        date_col = "var(--up)" if is_fresh else "var(--down)"
+        tag      = "今日" if is_fresh else "舊聞"
+        html += (f'<div class="news-item">'
+                 f'<div class="news-dot" style="background:{dot_col}"></div>'
+                 f'<div>'
+                 f'<div class="news-text">{a.get("title","")}</div>'
+                 f'<div class="news-source" style="color:{date_col}">[{tag}] {a.get("source","")} · {a.get("date","")}</div>'
+                 f'</div></div>')
+    html += '</div>'
+
     if tsla_imp:
-        html += f'<div style="margin-top:.65rem;padding-top:.55rem;border-top:1px solid var(--border);font-family:var(--mono,monospace);font-size:.68rem;color:var(--muted)">🚗 TSLA 影響：<span style="color:var(--text)">{tsla_imp}</span></div>'
+        html += ('<div style="margin-top:.65rem;padding-top:.55rem;border-top:1px solid var(--border);'
+                 'font-family:var(--mono,monospace);font-size:.68rem;color:var(--muted)">'
+                 f'🚗 TSLA 影響：<span style="color:var(--text)">{tsla_imp}</span></div>')
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
@@ -1107,12 +1223,13 @@ def main():
 
     # ── Intel panels ──────────────────────────────────────────────────────
     sk, gk = st.session_state.serper_key, st.session_state.groq_key
+    _today = _today_et_str()
     if show_trump:
         render_intel_panel("Trump 最新表態監控",
-            "Trump stock market statement Truth Social today", sk, gk, "🇺🇸")
+            f"Trump Truth Social statement stock market {_today}", sk, gk, "🇺🇸")
     if show_iran:
         render_intel_panel("伊朗戰爭 · 油價消息",
-            "Iran US war oil price ceasefire deal today", sk, gk, "🛢️")
+            f"Iran war oil price Hormuz ceasefire {_today}", sk, gk, "🛢️")
 
     # ── Quick summary bar ─────────────────────────────────────────────────
     st.markdown('<div class="section-label">▸ 快速指標</div>', unsafe_allow_html=True)
