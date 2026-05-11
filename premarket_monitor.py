@@ -1033,20 +1033,28 @@ def generate_trading_prompt(events: list, oil_data: dict,
          for e in today_events]
     ) or "  （今日無已知重大事件）"
 
-    # Market snapshot — smart: show pre > reg > prev in that priority
+    # Market snapshot — session-aware: always show current session price
+    _et_now    = datetime.now(pytz.timezone("America/New_York"))
+    _et_t      = _et_now.time()
+    _is_pre_t  = time(4, 0)  <= _et_t < time(9, 30)
+    _is_reg_t  = time(9, 30) <= _et_t < time(16, 0)
+    _is_post_t = time(16, 0) <= _et_t < time(20, 0)
+
     def snap(d):
         if not d or d.get("error"): return "N/A"
-        # Pick best available price + pct
-        if d.get("pre_price") and d.get("pre_pct") is not None:
+        # Session-aware priority
+        if _is_pre_t and d.get("pre_price") and d.get("pre_pct") is not None:
             p, pct, tag = d["pre_price"], d["pre_pct"], "盤前"
-        elif d.get("post_price") and d.get("post_pct") is not None:
+        elif _is_reg_t and d.get("price") and d.get("reg_pct") is not None:
+            p, pct, tag = d["price"], d["reg_pct"], "盤中"
+        elif _is_post_t and d.get("post_price") and d.get("post_pct") is not None:
             p, pct, tag = d["post_price"], d["post_pct"], "盤後"
         elif d.get("price") and d.get("reg_pct") is not None:
             p, pct, tag = d["price"], d["reg_pct"], "收盤"
+        elif d.get("pre_price") and d.get("pre_pct") is not None:
+            p, pct, tag = d["pre_price"], d["pre_pct"], "盤前"
         else:
-            p   = d.get("price") or d.get("prev")
-            pct = None
-            tag = "收盤"
+            p, pct, tag = d.get("price") or d.get("prev"), None, "收盤"
         pct_str = fmt_pct(pct) if pct is not None else "—"
         return f"{fmt_num(p)} {pct_str} [{tag}]"
 
@@ -1066,8 +1074,9 @@ def generate_trading_prompt(events: list, oil_data: dict,
     wti_str   = f"${fmt_num(wti.get('price'))} ({fmt_pct(wti.get('pct'))})" if wti.get("price") else "N/A"
     brent_str = f"${fmt_num(brent.get('price'))} ({fmt_pct(brent.get('pct'))})" if brent.get("price") else "N/A"
 
+    fetch_time = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M:%S ET")
     prompt = f"""# 美股即時分析請求
-日期：{today_str}  時間：{time_str}  時段：{session}
+日期：{today_str}  時間：{fetch_time}  時段：{session}  數據抓取：{fetch_time}
 
 ## 今日全部宏觀事件
 {events_lines}
@@ -1191,7 +1200,10 @@ def main():
     col_btn1, col_btn2, col_space = st.columns([1.5, 1.5, 5])
     with col_btn1:
         if st.button("✨ 一鍵生成 AI Prompt"):
-            with st.spinner("整合市場數據中..."):
+            with st.spinner("整合最新市場數據中..."):
+                # Clear cache to force fresh data at prompt generation time
+                fetch_quote.clear()
+                fetch_oil_data.clear()
                 oil_data  = fetch_oil_data()
                 tsla_data = fetch_quote("TSLA")
                 vix_data  = fetch_quote("^VIX")
