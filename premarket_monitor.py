@@ -1072,17 +1072,35 @@ def main():
                      f'<div class="mini-value {col_cls}">{val}</div>'
                      f'<div class="mini-sub">{sub}</div></div>', unsafe_allow_html=True)
 
+    # Smart pct: pre > reg > post, whichever is available; label follows
+    def best_pct(d):
+        """Return (pct, price, label) using best available session data."""
+        if not d or d.get("error"):
+            return None, None, "—"
+        if d.get("pre_pct") is not None:
+            return d["pre_pct"], d.get("pre_price") or d.get("price"), "盤前"
+        if d.get("reg_pct") is not None:
+            return d["reg_pct"], d.get("price"), "收盤"
+        if d.get("post_pct") is not None:
+            return d["post_pct"], d.get("post_price"), "盤後"
+        return None, d.get("price"), "收盤"
+
     vp = vd.get("price")
     vc = "down" if (vp and vp>25) else ("up" if (vp and vp<18) else "flat")
     vl = "極度恐慌" if (vp and vp>30) else ("恐慌" if (vp and vp>20) else "平靜")
     mini(m1,"VIX 恐慌",fmt_num(vp),vl,vc)
 
-    sp = sd.get("pre_pct") if is_pre else sd.get("reg_pct")
-    mini(m2,"SPY 盤前%",fmt_pct(sp),f"收盤 {fmt_num(sd.get('price'))}",cc(sp))
-    qp = qd.get("pre_pct") if is_pre else qd.get("reg_pct")
-    mini(m3,"QQQ 盤前%",fmt_pct(qp),f"收盤 {fmt_num(qd.get('price'))}",cc(qp))
-    tp = td.get("pre_pct") if is_pre else td.get("reg_pct")
-    mini(m4,"TSLA 盤前%",fmt_pct(tp),f"收盤 {fmt_num(td.get('price'))}",cc(tp))
+    sp, sprice, slbl = best_pct(sd)
+    mini(m2, f"SPY {slbl}%", fmt_pct(sp),
+         f"收盤 {fmt_num(sd.get('price'))}", cc(sp))
+
+    qp, qprice, qlbl = best_pct(qd)
+    mini(m3, f"QQQ {qlbl}%", fmt_pct(qp),
+         f"收盤 {fmt_num(qd.get('price'))}", cc(qp))
+
+    tp, tprice, tlbl = best_pct(td)
+    mini(m4, f"TSLA {tlbl}%", fmt_pct(tp),
+         f"收盤 {fmt_num(td.get('price'))}", cc(tp))
 
     # ── Footer ────────────────────────────────────────────────────────────
     st.markdown(f"""
