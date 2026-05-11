@@ -225,11 +225,48 @@ def week_monday_str():
 
 
 # ── Quote fetching ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
+def _yf_info(ticker: str) -> dict:
+    """Try yfinance with curl_cffi session first (avoids Streamlit Cloud rate-limit),
+    then plain yfinance, then yfinance download as last resort."""
+    # Attempt 1: curl_cffi impersonation (best for cloud IPs)
+    try:
+        from curl_cffi import requests as curl_req
+        session = curl_req.Session(impersonate="chrome110")
+        t = yf.Ticker(ticker, session=session)
+        info = t.info
+        if info.get("regularMarketPrice") or info.get("previousClose"):
+            return info
+    except Exception:
+        pass
+
+    # Attempt 2: plain yfinance
+    try:
+        info = yf.Ticker(ticker).info
+        if info.get("regularMarketPrice") or info.get("previousClose"):
+            return info
+    except Exception:
+        pass
+
+    # Attempt 3: yfinance download → extract last close
+    try:
+        df = yf.download(ticker, period="2d", interval="1d", progress=False, auto_adjust=True)
+        if not df.empty:
+            cls = df["Close"]
+            if hasattr(cls, "iloc"):
+                price = float(cls.iloc[-1].item() if hasattr(cls.iloc[-1], "item") else cls.iloc[-1])
+                prev  = float(cls.iloc[-2].item() if len(cls) > 1 and hasattr(cls.iloc[-2], "item") else cls.iloc[-2]) if len(cls) > 1 else price
+                return {"regularMarketPrice": price, "previousClose": prev,
+                        "shortName": ticker, "currentPrice": price}
+    except Exception:
+        pass
+
+    raise RuntimeError("All yfinance methods failed")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_quote(ticker: str) -> dict:
     try:
-        t    = yf.Ticker(ticker)
-        info = t.info
+        info = _yf_info(ticker)
         price     = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
         prev      = info.get("previousClose") or info.get("regularMarketPreviousClose")
         pre_price = info.get("preMarketPrice")
@@ -473,12 +510,15 @@ def render_weekly_calendar(events: list, source_label: str):
             dot = ev.get("color","blue")
             ic  = imp_map.get(ev.get("impact","low"),"imp-low")
             il  = imp_text.get(ev.get("impact","low"),"")
-            note = ev.get("note","").replace('"',"'")
-            evs_html += f"""
-            <div class="cal-event" title="{note}">
-              <div class="cal-dot {dot}"></div>
-              <div><span class="cal-impact {ic}">{il}</span> {ev['text']}</div>
-            </div>"""
+            def _s(t): return (t or "").replace('"','').replace("'",'').replace("<",'').replace(">",'')
+            note = _s(ev.get("note",""))
+            text = _s(ev.get("text",""))
+            evs_html += (
+                f'<div class="cal-event" title="{note}">'
+                f'<div class="cal-dot {dot}"></div>'
+                f'<div><span class="cal-impact {ic}">{il}</span> {text}</div>'
+                f'</div>'
+            )
 
         cal_html += f"""
         <div class="{day_cls}">
