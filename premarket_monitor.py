@@ -227,12 +227,14 @@ def week_monday_str():
 # ── Quote fetching ────────────────────────────────────────────────────────────
 def _yahoo_chart_api(ticker: str) -> dict:
     """
-    Direct Yahoo Finance v8 chart API — returns pre/post market prices.
-    Most reliable on cloud IPs; no rate-limit issues like .info endpoint.
+    Yahoo Finance v8 chart API with 1m bars + includePrePost=true.
+    Scans timestamp array to extract real pre/post market closing prices.
+    Uses curl_cffi chrome124 impersonation for Streamlit Cloud compatibility.
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     params = {
-        "interval": "1d", "range": "2d",
+        "interval": "1m",
+        "range": "1d",
         "includePrePost": "true",
         "corsDomain": "finance.yahoo.com",
     }
@@ -242,44 +244,95 @@ def _yahoo_chart_api(ticker: str) -> dict:
                       "Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json",
         "Referer": "https://finance.yahoo.com/",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     try:
         from curl_cffi import requests as curl_req
         resp = curl_req.get(url, params=params, headers=headers,
-                            impersonate="chrome110", timeout=10)
+                            impersonate="chrome124", timeout=12)
     except Exception:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
 
-    data  = resp.json()
-    meta  = data["chart"]["result"][0]["meta"]
+    data   = resp.json()
+    result = data["chart"]["result"][0]
+    meta   = result["meta"]
+
     price = meta.get("regularMarketPrice") or meta.get("previousClose")
     prev  = meta.get("chartPreviousClose") or meta.get("previousClose") or price
 
-    # Pre/post market from meta
-    # Yahoo v8 chart meta sometimes omits preMarketPrice during regular hours.
-    # Fall back to v7 quote API which always includes it when available.
+    # meta fields (may be present)
     pre_price  = meta.get("preMarketPrice")
     post_price = meta.get("postMarketPrice")
 
-    if pre_price is None and not (ticker.endswith("=F") or ticker.startswith("^")):
-        try:
-            q_url = "https://query1.finance.yahoo.com/v7/finance/quote"
-            q_hdrs = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.yahoo.com/"}
-            q_params = {"symbols": ticker, "fields": "preMarketPrice,postMarketPrice,preMarketChange,preMarketChangePercent,postMarketChange,postMarketChangePercent"}
-            try:
-                from curl_cffi import requests as curl_req
-                qr = curl_req.get(q_url, params=q_params, headers=q_hdrs, impersonate="chrome110", timeout=8)
-            except Exception:
-                qr = requests.get(q_url, params=q_params, headers=q_hdrs, timeout=8)
-            qdata = qr.json()["quoteResponse"]["result"]
-            if qdata:
-                q = qdata[0]
-                pre_price  = q.get("preMarketPrice")  or pre_price
-                post_price = q.get("postMarketPrice") or post_price
-                if pre_price and not pre_price:
-                    pre_price = None
-        except Exception:
-            pass
+    # Scan 1m bars to extract pre/post prices from timestamps
+    et     = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    today  = now_et.date()
+
+    try:
+        timestamps = result.get("timestamp", [])
+        closes     = result["indicators"]["quote"][0].get("close", [])
+        highs      = result["indicators"]["quote"][0].get("high",  [])
+        lows       = result["indicators"]["quote"][0].get("low",   [])
+        volumes    = result["indicators"]["quote"][0].get("volume",[])
+
+        pre_bars  = []   # (ts, close)
+        post_bars = []
+        reg_highs = []
+        reg_lows  = []
+        reg_vols  = []
+
+        for i, ts in enumerate(timestamps):
+            cl = closes[i] if i < len(closes) else None
+            hi = highs[i]  if i < len(highs)  else None
+            lo = lows[i]   if i < len(lows)   else None
+            vo = volumes[i]if i < len(volumes) else None
+            if cl is None:
+                continue
+            dt = datetime.fromtimestamp(ts, tz=et)
+            if dt.date() != today:
+                continue
+            t = dt.time()
+            if time(4, 0) <= t < time(9, 30):
+                pre_bars.append(cl)
+            elif time(9, 30) <= t < time(16, 0):
+                if hi: reg_highs.append(hi)
+                if lo: reg_lows.append(lo)
+                if vo: reg_vols.append(vo)
+            elif time(16, 0) <= t < time(20, 0):
+                post_bars.append(cl)
+
+        if pre_bars  and pre_price  is None: pre_price  = pre_bars[-1]
+        if post_bars and post_price is None: post_price = post_bars[-1]
+
+        day_high = max(reg_highs) if reg_highs else None
+        day_low  = min(reg_lows)  if reg_lows  else None
+        volume   = sum(reg_vols)  if reg_vols  else None
+
+    except Exception:
+        day_high = day_low = volume = None
+
+    def _cp(p, base):
+        if p and base:
+            return p - base, (p - base) / base * 100
+        return None, None
+
+    pre_chg,  pre_pct  = _cp(pre_price,  prev)
+    post_chg, post_pct = _cp(post_price, price or prev)
+    reg_chg,  reg_pct  = _cp(price, prev)
+
+    return dict(
+        ticker    = ticker,
+        name      = meta.get("longName") or meta.get("shortName") or ticker,
+        price     = price,     prev      = prev,
+        reg_chg   = reg_chg,   reg_pct   = reg_pct,
+        pre_price = pre_price, pre_chg   = pre_chg,  pre_pct  = pre_pct,
+        post_price= post_price,post_chg  = post_chg, post_pct = post_pct,
+        high      = day_high,  low       = day_low,
+        volume    = volume,    avg_vol   = None,
+        cap       = None,      error     = None,
+    )
+
 
     def _chg_pct(p, base):
         if p and base:
