@@ -875,8 +875,8 @@ def generate_trading_prompt(events: list, oil_data: dict,
 
     # Today high-impact events for prompt
     high_events = [e for e in today_events if e.get("impact") == "high"]
-    high_lines = "
-".join(
+    _nl = chr(10)
+    high_lines = _nl.join(
         [f"  ⚠️ {e['text']} — {e.get('note','')}" for e in high_events]
     ) or "  （今日無已確認高影響事件）"
 
