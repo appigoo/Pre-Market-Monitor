@@ -214,6 +214,7 @@ def get_session_info():
     if   time(4,0)  <= t < time(9,30):  session = "盤前 PRE-MARKET"
     elif time(9,30) <= t < time(16,0):  session = "盤中 REGULAR"
     elif time(16,0) <= t < time(20,0):  session = "盤後 AFTER-HOURS"
+    elif time(20,0) <= t or t < time(4,0): session = "隔夜 OVERNIGHT"
     else:                                session = "休市 CLOSED"
     return now_et, session
 
@@ -293,13 +294,13 @@ def _yahoo_chart_api(ticker: str) -> dict:
             if dt.date() != today:
                 continue
             t = dt.time()
-            if time(4, 0) <= t < time(9, 30):
+            if t < time(9, 30):                      # 00:00-09:29 = overnight + pre-market
                 pre_bars.append(cl)
-            elif time(9, 30) <= t < time(16, 0):
+            elif time(9, 30) <= t < time(16, 0):      # regular session
                 if hi: reg_highs.append(hi)
                 if lo: reg_lows.append(lo)
                 if vo: reg_vols.append(vo)
-            elif time(16, 0) <= t < time(20, 0):
+            elif time(16, 0) <= t < time(20, 0):      # after-hours
                 post_bars.append(cl)
 
         if pre_bars  and pre_price  is None: pre_price  = pre_bars[-1]
@@ -400,7 +401,7 @@ def _yf_download_fallback(ticker: str) -> dict:
         df.index = df.index.tz_convert(et)
 
     today_df = df[df.index.date == today]
-    pre_df   = today_df[today_df.index.time < time(9, 30)]
+    pre_df   = today_df[today_df.index.time < time(9, 30)]  # 00:00-09:29 incl overnight
     reg_df   = today_df[(today_df.index.time >= time(9, 30)) & (today_df.index.time < time(16, 0))]
     post_df  = today_df[today_df.index.time >= time(16, 0)]
     prev_df  = df[df.index.date < today]
@@ -1118,7 +1119,7 @@ WATCHLISTS = {
 def main():
     inject_css()
     now_et, session = get_session_info()
-    is_pre  = "盤前" in session
+    is_pre  = "盤前" in session or "隔夜" in session  # overnight = pre-market
     is_post = "盤後" in session
 
     # Header
