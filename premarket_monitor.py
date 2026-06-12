@@ -172,7 +172,7 @@ DEFAULTS = {
     "serper_key": os.environ.get("SERPER_API_KEY", ""),
     "groq_key": os.environ.get("GROQ_API_KEY", ""),
     "weekly_events": None,
-    "weekly_events_fetched": "",   # date string when last fetched
+    "weekly_events_fetched": "",
     "ai_prompt": "",
     "show_prompt": False,
 }
@@ -229,7 +229,6 @@ def week_monday_str():
 def _yahoo_chart_api(ticker: str) -> dict:
     """
     Yahoo Finance v8 chart API with 1m bars + includePrePost=true.
-    Scans timestamp array to extract real pre/post market closing prices.
     Uses curl_cffi chrome124 impersonation for Streamlit Cloud compatibility.
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -265,11 +264,12 @@ def _yahoo_chart_api(ticker: str) -> dict:
     pre_price  = meta.get("preMarketPrice")
     post_price = meta.get("postMarketPrice")
 
-    # Scan 1m bars to extract pre/post prices from timestamps
+    # Scan 1m bars to extract pre/post prices and day high/low/volume
     et     = pytz.timezone("America/New_York")
     now_et = datetime.now(et)
     today  = now_et.date()
 
+    day_high = day_low = volume = avg_vol = None
     try:
         timestamps = result.get("timestamp", [])
         closes     = result["indicators"]["quote"][0].get("close", [])
@@ -277,7 +277,7 @@ def _yahoo_chart_api(ticker: str) -> dict:
         lows       = result["indicators"]["quote"][0].get("low",   [])
         volumes    = result["indicators"]["quote"][0].get("volume",[])
 
-        pre_bars  = []   # (ts, close)
+        pre_bars  = []
         post_bars = []
         reg_highs = []
         reg_lows  = []
@@ -294,13 +294,13 @@ def _yahoo_chart_api(ticker: str) -> dict:
             if dt.date() != today:
                 continue
             t = dt.time()
-            if t < time(9, 30):                      # 00:00-09:29 = overnight + pre-market
+            if t < time(9, 30):
                 pre_bars.append(cl)
-            elif time(9, 30) <= t < time(16, 0):      # regular session
+            elif time(9, 30) <= t < time(16, 0):
                 if hi: reg_highs.append(hi)
                 if lo: reg_lows.append(lo)
                 if vo: reg_vols.append(vo)
-            elif time(16, 0) <= t < time(20, 0):      # after-hours
+            elif time(16, 0) <= t < time(20, 0):
                 post_bars.append(cl)
 
         if pre_bars  and pre_price  is None: pre_price  = pre_bars[-1]
@@ -310,13 +310,11 @@ def _yahoo_chart_api(ticker: str) -> dict:
         day_low  = min(reg_lows)  if reg_lows  else None
         volume   = sum(reg_vols)  if reg_vols  else None
 
-
-        # Estimate avg_vol: extrapolate current pace to full 390-min session
         reg_bar_count = len(reg_vols) if reg_vols else 0
         frac = reg_bar_count / 390.0
         avg_vol = int(volume / frac) if (volume and frac > 0.05) else None
     except Exception:
-        day_high = day_low = volume = avg_vol = None
+        pass  # day_high/low/volume remain None
 
     def _cp(p, base):
         if p and base:
@@ -340,43 +338,6 @@ def _yahoo_chart_api(ticker: str) -> dict:
     )
 
 
-    def _chg_pct(p, base):
-        if p and base:
-            chg = p - base
-            pct = chg / base * 100
-            return chg, pct
-        return None, None
-
-    pre_chg,  pre_pct  = _chg_pct(pre_price,  prev)
-    post_chg, post_pct = _chg_pct(post_price, price or prev)
-    reg_chg,  reg_pct  = _chg_pct(price, prev)
-
-    # Day high/low from indicators if available
-    try:
-        ind   = data["chart"]["result"][0]["indicators"]["quote"][0]
-        highs = [x for x in (ind.get("high") or []) if x]
-        lows  = [x for x in (ind.get("low")  or []) if x]
-        vols  = [x for x in (ind.get("volume") or []) if x]
-        day_high = highs[-1] if highs else None
-        day_low  = lows[-1]  if lows  else None
-        volume   = int(vols[-1]) if vols else None
-    except Exception:
-        day_high = day_low = volume = None
-
-    return dict(
-        ticker    = ticker,
-        name      = meta.get("longName") or meta.get("shortName") or ticker,
-        price     = price,
-        prev      = prev,
-        reg_chg   = reg_chg,   reg_pct   = reg_pct,
-        pre_price = pre_price, pre_chg   = pre_chg,  pre_pct  = pre_pct,
-        post_price= post_price,post_chg  = post_chg, post_pct = post_pct,
-        high      = day_high,  low       = day_low,
-        volume    = volume,    avg_vol   = None,
-        cap       = None,      error     = None,
-    )
-
-
 def _yf_download_fallback(ticker: str) -> dict:
     """Last-resort: yf.download with prepost=True to get pre/post prices."""
     df = yf.download(ticker, period="5d", interval="1m",
@@ -384,16 +345,13 @@ def _yf_download_fallback(ticker: str) -> dict:
     if df.empty:
         raise RuntimeError("download returned empty")
 
-    # Flatten MultiIndex if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
     et      = pytz.timezone("America/New_York")
     now_et  = datetime.now(et)
     today   = now_et.date()
-    t_now   = now_et.time()
 
-    # Filter to today
     df.index = pd.to_datetime(df.index)
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert(et)
@@ -401,7 +359,7 @@ def _yf_download_fallback(ticker: str) -> dict:
         df.index = df.index.tz_convert(et)
 
     today_df = df[df.index.date == today]
-    pre_df   = today_df[today_df.index.time < time(9, 30)]  # 00:00-09:29 incl overnight
+    pre_df   = today_df[today_df.index.time < time(9, 30)]
     reg_df   = today_df[(today_df.index.time >= time(9, 30)) & (today_df.index.time < time(16, 0))]
     post_df  = today_df[today_df.index.time >= time(16, 0)]
     prev_df  = df[df.index.date < today]
@@ -435,16 +393,13 @@ def _yf_download_fallback(ticker: str) -> dict:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_quote(ticker: str) -> dict:
-    # Skip pre/post endpoints for futures (always regular market)
     is_future = ticker.endswith("=F") or ticker.startswith("^")
 
-    # Layer 1: Yahoo chart API (handles pre/post, cloud-friendly)
     try:
         return _yahoo_chart_api(ticker)
     except Exception:
         pass
 
-    # Layer 2: curl_cffi + yfinance .info
     if not is_future:
         try:
             from curl_cffi import requests as curl_req
@@ -475,11 +430,11 @@ def fetch_quote(ticker: str) -> dict:
         except Exception:
             pass
 
-    # Layer 3: yf.download with prepost=True (1-min bars)
     try:
         return _yf_download_fallback(ticker)
     except Exception as e:
         return dict(ticker=ticker, error=str(e))
+
 
 def render_quote_card(data, is_pre, is_post):
     if data.get("error"):
@@ -519,7 +474,6 @@ def render_quote_card(data, is_pre, is_post):
 
     vol, avg  = data.get("volume"), data.get("avg_vol")
     vol_ratio = f"{vol/avg:.1f}x" if (vol and avg) else "—"
-    # Use CSS class instead of inline style to avoid Streamlit escaping
     if vol and avg and vol / avg > 1.5:
         vol_cls = "down"
     elif vol and avg and vol / avg > 1.0:
@@ -527,7 +481,6 @@ def render_quote_card(data, is_pre, is_post):
     else:
         vol_cls = "flat"
 
-    # Build meta spans as a single string — no f-string interpolation inside markdown
     meta_parts = [f'<span>收盤 <b>{fmt_num(reg_price)}</b></span>']
     if pm_price:
         meta_parts.append(f'<span>盤前 <b class="up">{fmt_num(pm_price)}</b></span>')
@@ -561,7 +514,6 @@ def render_quote_card(data, is_pre, is_post):
 # ── Groq AI call ──────────────────────────────────────────────────────────────
 def groq_chat(prompt: str, groq_key: str, model: str = "llama-3.3-70b-versatile",
               max_tokens: int = 1200, temperature: float = 0.3) -> str:
-    """Single-turn Groq chat. Returns text or raises."""
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
@@ -575,35 +527,32 @@ def groq_chat(prompt: str, groq_key: str, model: str = "llama-3.3-70b-versatile"
 
 # ── Weekly events — Groq auto-generate ───────────────────────────────────────
 _FALLBACK_EVENTS = [
-    {"date":"2026-05-11","weekday":"周一 MON","events":[
-        {"text":"Kevin Warsh 就任美聯儲主席","color":"red","impact":"high","note":"Powell 5/15 卸任；Warsh 鷹派傾向，加息預期上移"},
-        {"text":"美中貿易談判磋商（日內瓦）","color":"amber","impact":"high","note":"90天關稅暫緩窗口期談判"},
+    {"date":"2026-06-09","weekday":"周一 MON","events":[
+        {"text":"Kevin Warsh 就任美聯儲主席","color":"red","impact":"high","note":"Powell 5/22 正式卸任；Warsh 鷹派傾向，加息預期上移"},
+        {"text":"美中貿易談判磋商","color":"amber","impact":"high","note":"90天關稅暫緩窗口期談判持續"},
     ]},
-    {"date":"2026-05-12","weekday":"周二 TUE","events":[
-        {"text":"4月 CPI 數據 08:30 ET","color":"red","impact":"high","note":"預期 YoY 2.4%；低於預期→科技升，高於→沽"},
+    {"date":"2026-06-10","weekday":"周二 TUE","events":[
+        {"text":"5月 CPI 數據 08:30 ET","color":"red","impact":"high","note":"預期 YoY 3.8%；低於預期→科技升，高於→沽"},
         {"text":"財政部標債拍賣","color":"blue","impact":"med","note":"結果影響殖利率走勢"},
     ]},
-    {"date":"2026-05-13","weekday":"周三 WED","events":[
-        {"text":"4月 PPI 數據 08:30 ET","color":"amber","impact":"high","note":"配合 CPI 判斷通脹方向"},
-        {"text":"Fed 官員講話","color":"purple","impact":"med","note":"Warsh 首次表態尤其關鍵"},
-        {"text":"Trump 赴北京峰會","color":"amber","impact":"high","note":"議題：貿易/台灣/伊朗/稀土"},
+    {"date":"2026-06-11","weekday":"周三 WED","events":[
+        {"text":"5月 PPI 數據 08:30 ET","color":"amber","impact":"high","note":"配合 CPI 判斷通脹方向"},
+        {"text":"伊朗/霍爾木茲海峽局勢","color":"red","impact":"high","note":"特朗普延後空襲，和平協議談判中，影響油價"},
     ]},
-    {"date":"2026-05-14","weekday":"周四 THU","events":[
-        {"text":"初領失業金 08:30 ET","color":"blue","impact":"med","note":"預期 22萬"},
-        {"text":"Fed 資產負債表 H.4.1","color":"blue","impact":"low","note":"每週四例行"},
-        {"text":"特習峰會主要會談日","color":"red","impact":"high","note":"協議框架若達成 → 大利好 TSLA/科技"},
+    {"date":"2026-06-12","weekday":"周四 THU","events":[
+        {"text":"SpaceX (SPCX) Nasdaq IPO","color":"red","impact":"high","note":"$135/股，$1.77T估值，Musk生態系統重估，TSLA間接受益"},
+        {"text":"密歇根大學消費者信心 10:00 ET","color":"amber","impact":"med","note":"通脹預期數據影響Fed路徑預期"},
+        {"text":"Baker Hughes 鑽井數","color":"blue","impact":"low","note":"油市供應端參考"},
     ]},
-    {"date":"2026-05-15","weekday":"周五 FRI","events":[
-        {"text":"Powell 主席任期正式結束","color":"purple","impact":"high","note":"Warsh 接掌"},
-        {"text":"4月 零售銷售 08:30 ET","color":"amber","impact":"med","note":"消費數據"},
-        {"text":"特習峰會結果公佈","color":"red","impact":"high","note":"週末前最後重磅"},
+    {"date":"2026-06-13","weekday":"周五 FRI","events":[
+        {"text":"FOMC 會議前靜默期結束（下週一三）","color":"purple","impact":"high","note":"Warsh 首次FOMC 6/16-17，市場預期利率不變但鷹派聲明"},
+        {"text":"美伊和平協議後續","color":"red","impact":"high","note":"若週末簽署→週一油價急跌，科技股gap up"},
     ]},
 ]
 
 _WEEKDAY_MAP = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI","周六 SAT","周日 SUN"]
 
 def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
-    """Fetch news → Groq → structured 5-day calendar. Cached in session_state per week."""
     monday = week_monday_str()
     if st.session_state.weekly_events and st.session_state.weekly_events_fetched == monday:
         return st.session_state.weekly_events
@@ -611,7 +560,6 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
     if not serper_key or not groq_key:
         return _FALLBACK_EVENTS
 
-    # Step 1: Serper news
     queries = [
         "US economic calendar CPI PPI retail sales this week",
         "Federal Reserve Fed chair Warsh Powell this week",
@@ -633,7 +581,6 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
     if not snippets:
         return _FALLBACK_EVENTS
 
-    # Step 2: Groq structures the calendar
     et = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
     mon   = today - timedelta(days=today.weekday())
@@ -675,7 +622,6 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
         raw = groq_chat(prompt, groq_key, max_tokens=1500, temperature=0.2)
         raw = raw.replace("```json","").replace("```","").strip()
         events = json.loads(raw)
-        # Validate structure
         for day in events:
             assert "date" in day and "events" in day
         st.session_state.weekly_events = events
@@ -689,7 +635,6 @@ def render_weekly_calendar(events: list, source_label: str):
     et = pytz.timezone("America/New_York")
     today_str = datetime.now(et).strftime("%Y-%m-%d")
 
-    # Today's high-impact alert strip
     for day in events:
         if day["date"] == today_str:
             high = [e for e in day.get("events",[]) if e.get("impact") == "high"]
@@ -705,7 +650,6 @@ def render_weekly_calendar(events: list, source_label: str):
     imp_map  = {"high":"imp-high","med":"imp-med","low":"imp-low"}
     imp_text = {"high":"高影響","med":"中影響","low":"低影響"}
 
-    # Build calendar title from date range
     if events:
         d0 = datetime.strptime(events[0]["date"],"%Y-%m-%d")
         d4 = datetime.strptime(events[-1]["date"],"%Y-%m-%d")
@@ -812,9 +756,11 @@ def render_oil_panel():
     wti = oil.get("CL=F",{})
     p, pct = wti.get("price"), wti.get("pct")
     if p and pct is not None:
+        # FIX: 根據實際漲跌方向動態生成提示文字
         if   pct >  2: msg,bg,bc,tc = f"⚠️ WTI 急升 <b>{fmt_pct(pct)}</b>，科技股承壓，注意通脹預期上移", "#FDECEA","#C0392B","#7B1A12"
         elif pct >  0.5: msg,bg,bc,tc = f"🔶 WTI 上漲 <b>{fmt_pct(pct)}</b>，留意 TSLA/科技股壓力", "#FFF8E8","#D4A017","#6B5000"
-        elif pct < -2: msg,bg,bc,tc = f"✅ WTI 下跌 <b>{fmt_pct(pct)}</b>，通脹壓力減輕，利好科技/成長股", "#EAF4EE","#3A7D5C","#1E4D35"
+        elif pct < -2: msg,bg,bc,tc = f"✅ WTI 急跌 <b>{fmt_pct(pct)}</b>，通脹壓力減輕，利好科技/成長股", "#EAF4EE","#3A7D5C","#1E4D35"
+        elif pct < -0.5: msg,bg,bc,tc = f"🔽 WTI 下跌 <b>{fmt_pct(pct)}</b>，能源成本回落，科技股溫和利好", "#EAF4EE","#3A7D5C","#1E4D35"
         else:          msg,bg,bc,tc = f"WTI 平穩 <b>{fmt_pct(pct)}</b>，能源因素對市場影響中性", "#F0EDE8","#D8D0C0","#8A8278"
         st.markdown(f'<div style="background:{bg};border-left:3px solid {bc};border-radius:0 4px 4px 0;'
                     f'padding:.5rem .85rem;font-size:.76rem;color:{tc};margin-top:.45rem">{msg}</div>',
@@ -825,39 +771,29 @@ def render_oil_panel():
 def _today_et_str() -> str:
     return datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
 
-@st.cache_data(ttl=180, show_spinner=False)   # 3-min cache (was 5-min)
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_news(query: str, serper_key: str, num: int = 8) -> list:
-    """Fetch news with today's date appended to query, filter stale articles."""
     if not serper_key: return []
     today = _today_et_str()
-    # Append today's date to bias Serper toward today's results
     dated_query = f"{query} {today}"
     try:
         r = requests.post("https://google.serper.dev/news",
             headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
             json={"q": dated_query, "num": num, "hl": "en", "gl": "us",
-                  "tbs": "qdr:d"},   # tbs=qdr:d = past 24 hours filter
+                  "tbs": "qdr:d"},
             timeout=8)
         articles = r.json().get("news", [])
-
-        # Filter: keep only articles from today or yesterday (recency guard)
-        from datetime import timedelta
-        et     = pytz.timezone("America/New_York")
-        now_et = datetime.now(et)
-        cutoff = (now_et - timedelta(hours=36)).strftime("%Y-%m-%d")
 
         fresh = []
         stale = []
         for a in articles:
             date_str = a.get("date", "")
-            # Serper returns relative dates like "3 hours ago", "1 day ago"
-            # or absolute like "May 11, 2026" — treat missing/old as stale
             is_fresh = (
                 "hour" in date_str or
                 "minute" in date_str or
                 "just now" in date_str.lower() or
                 today in date_str or
-                date_str == ""  # unknown date — include with warning
+                date_str == ""
             )
             if is_fresh:
                 a["_fresh"] = True
@@ -866,7 +802,6 @@ def fetch_news(query: str, serper_key: str, num: int = 8) -> list:
                 a["_fresh"] = False
                 stale.append(a)
 
-        # Return fresh first; if fewer than 3 fresh, pad with stale
         result = fresh + stale
         return result[:6]
     except Exception:
@@ -876,10 +811,9 @@ def fetch_news(query: str, serper_key: str, num: int = 8) -> list:
 def groq_news_summary(articles: list, topic: str, groq_key: str) -> dict:
     if not articles or not groq_key:
         return {"summary":"","signal":"neutral","signal_reason":"","bullets":[],"tsla_impact":"","stale_warning":False}
-    
+
     today = _today_et_str()
-    
-    # Tag each article with freshness for Groq context
+
     tagged = []
     stale_count = 0
     for a in articles[:6]:
@@ -892,7 +826,7 @@ def groq_news_summary(articles: list, topic: str, groq_key: str) -> dict:
             f"內容：{a.get('snippet','')}"
         )
     block = "\n\n".join(tagged)
-    has_stale = stale_count > len(articles[:6]) // 2  # majority stale
+    has_stale = stale_count > len(articles[:6]) // 2
 
     prompt = f"""你是美股即時交易員分析師。今日日期：{today}（美東時間）
 
@@ -949,22 +883,19 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
     summary      = ai.get("summary","")
     bullets      = ai.get("bullets",[])
     tsla_imp     = ai.get("tsla_impact","")
-    news_date    = ai.get("news_date","")
     stale_warn   = ai.get("stale_warning", False)
     sig_cls  = {"bullish":"signal-bullish","bearish":"signal-bearish"}.get(signal,"signal-neutral")
     sig_text = {"bullish":"▲ 利多","bearish":"▼ 利空","neutral":"◆ 中性"}.get(signal,"◆ 中性")
     now_str  = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
     today    = _today_et_str()
 
-    # Count fresh vs stale articles
     fresh_count = sum(1 for a in articles if a.get("_fresh", True))
     total_count = len(articles)
 
     html = '<div class="intel-panel">'
     html += f'<div class="intel-header">'
     html += f'<div class="intel-title">{title}<span class="signal-badge {sig_cls}">{sig_text} {sig_reason}</span></div>'
-    
-    # Freshness indicator
+
     if fresh_count == total_count:
         freshness = f'<span style="color:var(--up);font-size:.6rem">● 全部今日</span>'
     elif fresh_count == 0:
@@ -974,7 +905,6 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
     html += f'<div class="intel-time">{freshness} &nbsp;Groq · {now_str}</div>'
     html += '</div>'
 
-    # Stale warning banner
     if stale_warn or fresh_count == 0:
         html += ('<div style="background:#FFF3CD;border-left:3px solid #D4A017;border-radius:0 4px 4px 0;'
                  'padding:.4rem .8rem;font-size:.72rem;color:#856404;margin-bottom:.6rem">'
@@ -988,8 +918,7 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
             dc = {"red":"red","amber":"amber"}.get(b.get("level",""),"")
             html += (f'<div class="news-item"><div class="news-dot {dc}"></div>'
                      f'<div><div class="news-text">{b.get("text","")}</div></div></div>')
-    
-    # Always show raw article headlines with date tags
+
     html += '<div style="margin-top:.6rem;padding-top:.5rem;border-top:1px solid var(--border)">'
     for a in articles[:5]:
         is_fresh = a.get("_fresh", True)
@@ -1013,17 +942,23 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
 
 
 # ── AI Prompt Generator ───────────────────────────────────────────────────────
+def _oil_direction_label(pct) -> str:
+    """Return a direction label for WTI based on actual % change."""
+    if pct is None: return "變動"
+    if pct >  2:    return "急升"
+    if pct >  0.5:  return "上漲"
+    if pct < -2:    return "急跌"
+    if pct < -0.5:  return "下跌"
+    return "平穩"
+
 def generate_trading_prompt(events: list, oil_data: dict,
                              tsla_data: dict, vix_data: dict,
                              qqq_data: dict, is_pre: bool) -> str:
-    """Build a rich, ready-to-paste prompt for any AI chatbot."""
     et       = pytz.timezone("America/New_York")
     now_et   = datetime.now(et)
     today_str = now_et.strftime("%Y-%m-%d")
-    time_str  = now_et.strftime("%H:%M ET")
     session   = "盤前" if is_pre else "盤中/盤後"
 
-    # Today's events
     today_events = []
     for day in events:
         if day["date"] == today_str:
@@ -1034,7 +969,6 @@ def generate_trading_prompt(events: list, oil_data: dict,
          for e in today_events]
     ) or "  （今日無已知重大事件）"
 
-    # Market snapshot — session-aware: always show current session price
     _et_now    = datetime.now(pytz.timezone("America/New_York"))
     _et_t      = _et_now.time()
     _is_pre_t  = time(4, 0)  <= _et_t < time(9, 30)
@@ -1043,7 +977,6 @@ def generate_trading_prompt(events: list, oil_data: dict,
 
     def snap(d):
         if not d or d.get("error"): return "N/A"
-        # Session-aware priority
         if _is_pre_t and d.get("pre_price") and d.get("pre_pct") is not None:
             p, pct, tag = d["pre_price"], d["pre_pct"], "盤前"
         elif _is_reg_t and d.get("price") and d.get("reg_pct") is not None:
@@ -1062,7 +995,6 @@ def generate_trading_prompt(events: list, oil_data: dict,
     wti   = oil_data.get("CL=F", {}) if oil_data else {}
     brent = oil_data.get("BZ=F", {}) if oil_data else {}
 
-    # Today high-impact events for prompt
     high_events = [e for e in today_events if e.get("impact") == "high"]
     _nl = chr(10)
     high_lines = _nl.join(
@@ -1072,8 +1004,12 @@ def generate_trading_prompt(events: list, oil_data: dict,
     tsla_snap = snap(tsla_data) if tsla_data else "N/A"
     qqq_snap  = snap(qqq_data)  if qqq_data  else "N/A"
     vix_val   = fmt_num(vix_data.get("price")) if vix_data and not vix_data.get("error") else "N/A"
-    wti_str   = f"${fmt_num(wti.get('price'))} ({fmt_pct(wti.get('pct'))})" if wti.get("price") else "N/A"
-    brent_str = f"${fmt_num(brent.get('price'))} ({fmt_pct(brent.get('pct'))})" if brent.get("price") else "N/A"
+
+    # FIX: 用實際漲跌方向，唔係寫死「急升」
+    wti_pct    = wti.get("pct")
+    wti_str    = f"${fmt_num(wti.get('price'))} ({fmt_pct(wti_pct)})" if wti.get("price") else "N/A"
+    brent_str  = f"${fmt_num(brent.get('price'))} ({fmt_pct(brent.get('pct'))})" if brent.get("price") else "N/A"
+    wti_dir    = _oil_direction_label(wti_pct)  # 動態方向標籤
 
     fetch_time = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M:%S ET")
     prompt = f"""# 美股即時分析請求
@@ -1096,7 +1032,7 @@ def generate_trading_prompt(events: list, oil_data: dict,
 
 ## 請幫我分析：
 1. **今日最大風險/機會**是什麼？對 TSLA 和納指方向的影響？
-2. **油價急升 {wti_str}** 對今日科技股有何具體影響？
+2. **油價{wti_dir} {wti_str}** 對今日科技股有何具體影響？
 3. **TSLA 今日交易策略**：建議入場區間、止損位、目標位（$數字）？
 4. **VIX {vix_val}** 顯示市場情緒如何？適合做多/做空/觀望？
 5. 今日最需要關注的**時間點**（數據發布/官員講話/峰會消息）？
@@ -1119,10 +1055,9 @@ WATCHLISTS = {
 def main():
     inject_css()
     now_et, session = get_session_info()
-    is_pre  = "盤前" in session or "隔夜" in session  # overnight = pre-market
+    is_pre  = "盤前" in session or "隔夜" in session
     is_post = "盤後" in session
 
-    # Header
     st.markdown(f"""
     <div class="pm-header">
       <div>
@@ -1134,7 +1069,6 @@ def main():
       <div class="pm-clock">{now_et.strftime('%Y-%m-%d')}<br><b>{now_et.strftime('%H:%M:%S')} ET</b></div>
     </div>""", unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚙️ 設定")
         auto = st.toggle("自動刷新", value=st.session_state.auto_refresh)
@@ -1179,7 +1113,6 @@ def main():
             st.session_state.weekly_events_fetched = ""
             st.rerun()
 
-    # ── Session alert ─────────────────────────────────────────────────────
     if is_pre:
         st.markdown('<div class="alert-box">⏰ <b>盤前交易時段</b> — 流動性較低，請注意風險管理</div>',
                     unsafe_allow_html=True)
@@ -1187,7 +1120,6 @@ def main():
         st.markdown('<div class="alert-box">🌙 <b>盤後交易時段</b> — 財報/消息驅動，缺口風險較高</div>',
                     unsafe_allow_html=True)
 
-    # ── Weekly calendar (AI auto-generated) ───────────────────────────────
     with st.spinner("📅 載入本週事件日曆..."):
         events = fetch_weekly_events(st.session_state.serper_key, st.session_state.groq_key)
     is_ai = bool(st.session_state.serper_key and st.session_state.groq_key
@@ -1195,14 +1127,12 @@ def main():
     source_label = "✨ Groq AI 自動生成 · 每週一自動更新" if is_ai else "📋 內置數據 · 輸入 Serper + Groq Key 啟用自動更新"
     render_weekly_calendar(events, source_label)
 
-    # ── 🤖 AI Prompt Generator button ─────────────────────────────────────
     st.markdown('<div class="section-label">▸ 🤖 AI 交易分析助手</div>', unsafe_allow_html=True)
 
     col_btn1, col_btn2, col_space = st.columns([1.5, 1.5, 5])
     with col_btn1:
         if st.button("✨ 一鍵生成 AI Prompt"):
             with st.spinner("整合最新市場數據中..."):
-                # Clear cache to force fresh data at prompt generation time
                 fetch_quote.clear()
                 fetch_oil_data.clear()
                 oil_data  = fetch_oil_data()
@@ -1225,7 +1155,6 @@ def main():
         st.code(st.session_state.ai_prompt, language="markdown")
         st.caption("👆 點擊右上角複製圖示即可一鍵複製")
 
-    # ── Stock sections ────────────────────────────────────────────────────
     all_sections = {"核心持倉": WATCHLISTS["核心持倉"], "指數ETF": WATCHLISTS["指數ETF"]}
     if show_vix:     all_sections["波動/恐慌"] = WATCHLISTS["波動/恐慌"]
     if show_lev:     all_sections["槓桿ETF"]   = WATCHLISTS["槓桿ETF"]
@@ -1241,11 +1170,9 @@ def main():
             with cols[i % 2]:
                 render_quote_card(fetch_quote(ticker), is_pre, is_post)
 
-    # ── Oil panel ─────────────────────────────────────────────────────────
     if show_oil:
         render_oil_panel()
 
-    # ── Intel panels ──────────────────────────────────────────────────────
     sk, gk = st.session_state.serper_key, st.session_state.groq_key
     _today = _today_et_str()
     if show_trump:
@@ -1255,7 +1182,6 @@ def main():
         render_intel_panel("伊朗戰爭 · 油價消息",
             f"Iran war oil price Hormuz ceasefire {_today}", sk, gk, "🛢️")
 
-    # ── Quick summary bar ─────────────────────────────────────────────────
     st.markdown('<div class="section-label">▸ 快速指標</div>', unsafe_allow_html=True)
     vd = fetch_quote("^VIX"); sd = fetch_quote("SPY")
     qd = fetch_quote("QQQ");  td = fetch_quote("TSLA")
@@ -1266,9 +1192,7 @@ def main():
                      f'<div class="mini-value {col_cls}">{val}</div>'
                      f'<div class="mini-sub">{sub}</div></div>', unsafe_allow_html=True)
 
-    # Smart pct: pre > reg > post, whichever is available; label follows
     def best_pct(d):
-        """Return (pct, price, label) using best available session data."""
         if not d or d.get("error"):
             return None, None, "—"
         et_t = datetime.now(pytz.timezone("America/New_York")).time()
@@ -1289,25 +1213,20 @@ def main():
     mini(m1,"VIX 恐慌",fmt_num(vp),vl,vc)
 
     sp, sprice, slbl = best_pct(sd)
-    mini(m2, f"SPY {slbl}%", fmt_pct(sp),
-         f"收盤 {fmt_num(sd.get('price'))}", cc(sp))
+    mini(m2, f"SPY {slbl}%", fmt_pct(sp), f"收盤 {fmt_num(sd.get('price'))}", cc(sp))
 
     qp, qprice, qlbl = best_pct(qd)
-    mini(m3, f"QQQ {qlbl}%", fmt_pct(qp),
-         f"收盤 {fmt_num(qd.get('price'))}", cc(qp))
+    mini(m3, f"QQQ {qlbl}%", fmt_pct(qp), f"收盤 {fmt_num(qd.get('price'))}", cc(qp))
 
     tp, tprice, tlbl = best_pct(td)
-    mini(m4, f"TSLA {tlbl}%", fmt_pct(tp),
-         f"收盤 {fmt_num(td.get('price'))}", cc(tp))
+    mini(m4, f"TSLA {tlbl}%", fmt_pct(tp), f"收盤 {fmt_num(td.get('price'))}", cc(tp))
 
-    # ── Footer ────────────────────────────────────────────────────────────
     st.markdown(f"""
     <div style="font-family:var(--mono,monospace);font-size:.62rem;color:#AAA49C;
          text-align:center;padding:1.8rem 0 .8rem;border-top:1px solid #D8D0C0;margin-top:1.8rem">
       最後更新 {datetime.now().strftime('%H:%M:%S')} · 股價延遲 15-20 分鐘 · Groq AI 免費版 · 僅供參考，不構成投資建議
     </div>""", unsafe_allow_html=True)
 
-    # ── Auto refresh ──────────────────────────────────────────────────────
     if st.session_state.auto_refresh:
         time_module.sleep(st.session_state.refresh_interval)
         st.cache_data.clear()
