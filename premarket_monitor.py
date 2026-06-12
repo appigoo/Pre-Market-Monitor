@@ -710,20 +710,77 @@ OIL_TICKERS = {
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_oil_data() -> dict:
+    """
+    Fetch oil/gas futures prices.
+    Layer 1: _yahoo_chart_api (curl_cffi, cloud-friendly, same as stock quotes)
+    Layer 2: yf.download fallback
+    Layer 3: yf.Ticker().info last resort
+    """
     results = {}
     for ticker, meta in OIL_TICKERS.items():
+        d = None
+        # Layer 1: chart API (handles futures well)
         try:
-            info  = yf.Ticker(ticker).info
-            price = info.get("regularMarketPrice") or info.get("previousClose")
-            prev  = info.get("previousClose") or info.get("regularMarketPreviousClose")
-            chg   = (price - prev) if (price and prev) else None
-            pct   = (chg / prev * 100) if (chg and prev) else None
-            results[ticker] = dict(label=meta["label"], unit=meta["unit"], price=price,
-                                   chg=chg, pct=pct,
-                                   high=info.get("dayHigh") or info.get("regularMarketDayHigh"),
-                                   low =info.get("dayLow")  or info.get("regularMarketDayLow"))
-        except Exception as e:
-            results[ticker] = dict(label=meta["label"], unit=meta["unit"], error=str(e))
+            d = _yahoo_chart_api(ticker)
+        except Exception:
+            pass
+
+        # Layer 2: yf.download 5d/1d bar
+        if d is None or d.get("error") or not d.get("price"):
+            try:
+                df = yf.download(ticker, period="5d", interval="1d",
+                                 progress=False, auto_adjust=True)
+                if not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    price = float(df["Close"].iloc[-1])
+                    prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
+                    chg   = price - prev
+                    pct   = chg / prev * 100 if prev else None
+                    high  = float(df["High"].iloc[-1])  if "High"  in df.columns else None
+                    low   = float(df["Low"].iloc[-1])   if "Low"   in df.columns else None
+                    d = dict(ticker=ticker, price=price, prev=prev,
+                             reg_chg=chg, reg_pct=pct,
+                             pre_price=None, post_price=None,
+                             high=high, low=low,
+                             volume=None, avg_vol=None, cap=None, error=None,
+                             name=meta["label"])
+            except Exception:
+                pass
+
+        # Layer 3: yf.Ticker().info
+        if d is None or d.get("error") or not d.get("price"):
+            try:
+                info  = yf.Ticker(ticker).info
+                price = info.get("regularMarketPrice") or info.get("previousClose")
+                prev  = info.get("previousClose") or info.get("regularMarketPreviousClose")
+                if price:
+                    chg = (price - prev) if (price and prev) else None
+                    pct = (chg / prev * 100) if (chg and prev) else None
+                    d = dict(ticker=ticker, price=price, prev=prev,
+                             reg_chg=chg, reg_pct=pct,
+                             pre_price=None, post_price=None,
+                             high=info.get("dayHigh") or info.get("regularMarketDayHigh"),
+                             low =info.get("dayLow")  or info.get("regularMarketDayLow"),
+                             volume=None, avg_vol=None, cap=None, error=None,
+                             name=meta["label"])
+            except Exception as e:
+                d = dict(error=str(e))
+
+        if d and not d.get("error") and d.get("price"):
+            # Normalise: oil panel uses price/chg/pct — map from quote dict fields
+            price = d.get("price")
+            prev  = d.get("prev")
+            chg   = d.get("reg_chg") or ((price - prev) if (price and prev) else None)
+            pct   = d.get("reg_pct") or ((chg / prev * 100) if (chg and prev) else None)
+            results[ticker] = dict(
+                label = meta["label"], unit = meta["unit"],
+                price = price, chg = chg, pct = pct,
+                high  = d.get("high"), low = d.get("low"),
+            )
+        else:
+            results[ticker] = dict(label=meta["label"], unit=meta["unit"],
+                                   error=d.get("error","fetch failed") if d else "fetch failed")
     return results
 
 def render_oil_panel():
@@ -911,13 +968,15 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
                  f'⚠️ 未找到 {today} 的最新消息，以下為近期背景資訊，請自行核實最新發展</div>')
 
     if summary:
-        html += f'<div class="intel-summary">{summary}</div>'
+        import html as _html
+        html += f'<div class="intel-summary">{_html.escape(summary)}</div>'
 
     if bullets:
+        import html as _html
         for b in bullets:
             dc = {"red":"red","amber":"amber"}.get(b.get("level",""),"")
             html += (f'<div class="news-item"><div class="news-dot {dc}"></div>'
-                     f'<div><div class="news-text">{b.get("text","")}</div></div></div>')
+                     f'<div><div class="news-text">{_html.escape(b.get("text",""))}</div></div></div>')
 
     html += '<div style="margin-top:.6rem;padding-top:.5rem;border-top:1px solid var(--border)">'
     for a in articles[:5]:
@@ -925,18 +984,24 @@ def render_intel_panel(title: str, query: str, serper_key: str, groq_key: str, i
         dot_col  = "var(--up)" if is_fresh else "var(--down)"
         date_col = "var(--up)" if is_fresh else "var(--down)"
         tag      = "今日" if is_fresh else "舊聞"
+        # Escape title/source to prevent apostrophes and HTML chars breaking the markup
+        import html as _html
+        title_safe  = _html.escape(a.get("title",""))
+        source_safe = _html.escape(a.get("source",""))
+        date_safe   = _html.escape(a.get("date",""))
         html += (f'<div class="news-item">'
                  f'<div class="news-dot" style="background:{dot_col}"></div>'
                  f'<div>'
-                 f'<div class="news-text">{a.get("title","")}</div>'
-                 f'<div class="news-source" style="color:{date_col}">[{tag}] {a.get("source","")} · {a.get("date","")}</div>'
+                 f'<div class="news-text">{title_safe}</div>'
+                 f'<div class="news-source" style="color:{date_col}">[{tag}] {source_safe} · {date_safe}</div>'
                  f'</div></div>')
     html += '</div>'
 
     if tsla_imp:
+        import html as _html
         html += ('<div style="margin-top:.65rem;padding-top:.55rem;border-top:1px solid var(--border);'
                  'font-family:var(--mono,monospace);font-size:.68rem;color:var(--muted)">'
-                 f'🚗 TSLA 影響：<span style="color:var(--text)">{tsla_imp}</span></div>')
+                 f'🚗 TSLA 影響：<span style="color:var(--text)">{_html.escape(tsla_imp)}</span></div>')
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
