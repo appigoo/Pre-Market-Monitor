@@ -1182,18 +1182,27 @@ def main():
             st.rerun()
 
     # ── Header ────────────────────────────────────────────────────────────────
-    refresh_indicator = f'<span style="font-family:var(--mono,monospace);font-size:.6rem;color:var(--up,#3A7D5C)">⏱ 自動刷新 {st.session_state.refresh_interval}s</span>' if st.session_state.auto_refresh else ""
-    st.markdown(f"""
-    <div class="pm-header">
-      <div>
-        <div class="pm-title">📅 Pre-Market Monitor
-          <span class="pm-session-badge">{session}</span>
-          {refresh_indicator}
-        </div>
-        <div class="pm-subtitle">美股盤前即時監控 · Fortune Trading Desk · Groq AI · v4</div>
-      </div>
-      <div class="pm-clock">{now_et.strftime('%Y-%m-%d')}<br><b>{now_et.strftime('%H:%M:%S')} ET</b></div>
-    </div>""", unsafe_allow_html=True)
+    # Build as string concat — triple-quote f-string with strftime % can break markdown parser
+    _iv   = st.session_state.refresh_interval
+    _rbadge = (
+        '<span style="font-family:var(--mono,monospace);font-size:.6rem;'
+        'color:var(--up,#3A7D5C);margin-left:.4rem">&#9203; ' + str(_iv) + 's</span>'
+    ) if st.session_state.auto_refresh else ""
+    _date = now_et.strftime("%Y-%m-%d")
+    _time = now_et.strftime("%H:%M:%S")
+    _hdr  = (
+        '<div class="pm-header">'
+        '<div>'
+        '<div class="pm-title">&#128197; Pre-Market Monitor'
+        '<span class="pm-session-badge">' + session + '</span>'
+        + _rbadge +
+        '</div>'
+        '<div class="pm-subtitle">美股盤前即時監控 &middot; Fortune Trading Desk &middot; Groq AI &middot; v4</div>'
+        '</div>'
+        '<div class="pm-clock">' + _date + '<br><b>' + _time + ' ET</b></div>'
+        '</div>'
+    )
+    st.markdown(_hdr, unsafe_allow_html=True)
 
     if is_pre:
         st.markdown('<div class="alert-box">⏰ <b>盤前交易時段</b> — 流動性較低，請注意風險管理</div>', unsafe_allow_html=True)
