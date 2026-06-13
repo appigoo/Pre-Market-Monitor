@@ -36,12 +36,12 @@ DEFAULTS = {
     "ai_prompt":             "",
     "show_prompt":           False,
     "dark_mode":             False,
-    # price alerts: list of {"ticker","direction","price","label"}
+    # price alerts
     "price_alerts":          [],
     "alert_ticker":          "TSLA",
     "alert_price":           "",
     "alert_dir":             "突破上方",
-    # news panel manual-refresh timestamps {panel_title: epoch}
+    # news panel manual-refresh timestamps
     "news_refresh":          {},
     # copy feedback
     "prompt_copied":         False,
@@ -49,6 +49,16 @@ DEFAULTS = {
     # VIX yesterday cache
     "vix_prev":              None,
     "vix_prev_date":         "",
+    # Telegram
+    "tg_token":              os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "tg_chat_id":            os.environ.get("TELEGRAM_CHAT_ID", ""),
+    "tg_sent_hashes":        set(),   # MD5 dedup
+    "tg_vix_threshold":      25.0,
+    "tg_tsla_pct_threshold": 3.0,
+    "tg_yield_threshold":    4.5,
+    # TSLA tech panel
+    "tsla_shares":           100,
+    "tech_period":           "3mo",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -217,6 +227,44 @@ def inject_css():
         padding:.5rem .8rem;font-size:.76rem;color:var(--down);margin-top:.5rem;font-family:var(--sans);}}
     .cal-source{{font-family:var(--mono);font-size:.55rem;color:var(--muted);
         margin-top:.4rem;padding-top:.4rem;border-top:1px solid var(--border);}}
+
+    /* TSLA TECHNICAL PANEL */
+    .tech-wrap{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:1rem 1.15rem;margin-bottom:.5rem;}}
+    .tech-header{{display:flex;justify-content:space-between;align-items:center;
+        margin-bottom:.8rem;padding-bottom:.45rem;border-bottom:1px solid var(--border);}}
+    .tech-title{{font-family:var(--mono);font-size:.72rem;font-weight:600;
+        letter-spacing:.08em;color:var(--accent);text-transform:uppercase;}}
+    .tech-price{{font-family:var(--mono);font-size:1.5rem;font-weight:700;}}
+    .tech-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin-bottom:.6rem;}}
+    .tech-card{{background:var(--bg);border:1px solid var(--border);border-radius:5px;
+        padding:.6rem .8rem;text-align:center;}}
+    .tech-card.active{{border-color:var(--accent);background:var(--card);}}
+    .tech-card.warn{{border-color:var(--down);background:var(--down-bg);}}
+    .tech-clabel{{font-family:var(--mono);font-size:.55rem;letter-spacing:.1em;
+        text-transform:uppercase;color:var(--muted);margin-bottom:.15rem;}}
+    .tech-cval{{font-family:var(--mono);font-size:.92rem;font-weight:600;}}
+    .tech-csub{{font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.06rem;}}
+    .level-row{{display:flex;justify-content:space-between;align-items:center;
+        padding:.3rem 0;border-bottom:1px dotted var(--border);font-family:var(--mono);font-size:.72rem;}}
+    .level-row:last-child{{border-bottom:none;}}
+    .level-label{{color:var(--muted);font-size:.62rem;letter-spacing:.06em;}}
+    .level-zone{{font-family:var(--sans);font-size:.68rem;color:var(--muted);}}
+    .gap-badge{{display:inline-block;font-family:var(--mono);font-size:.62rem;font-weight:700;
+        padding:.15rem .5rem;border-radius:3px;margin-left:.4rem;}}
+    .gap-up{{background:var(--up-bg);color:var(--up);}}
+    .gap-down{{background:var(--down-bg);color:var(--down);}}
+    .signal-row{{background:var(--bg2);border-radius:5px;padding:.55rem .8rem;
+        font-family:var(--sans);font-size:.76rem;line-height:1.65;margin-top:.5rem;}}
+
+    /* TELEGRAM PANEL */
+    .tg-panel{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.8rem 1rem;margin-bottom:.5rem;}}
+    .tg-log{{font-family:var(--mono);font-size:.65rem;color:var(--muted);
+        max-height:120px;overflow-y:auto;padding:.4rem .6rem;
+        background:var(--bg);border-radius:4px;margin-top:.4rem;border:1px solid var(--border);}}
+    .tg-log-item{{padding:.12rem 0;border-bottom:1px dotted var(--border);}}
+    .tg-log-item:last-child{{border-bottom:none;}}
 
     .oil-card{{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.75rem 1rem;}}
     .oil-label{{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.22rem;}}
@@ -1197,6 +1245,432 @@ def render_oil_panel():
                     unsafe_allow_html=True)
 
 
+
+# ── TSLA Technical Analysis Panel ─────────────────────────────────────────────
+import hashlib as _hashlib
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, pc = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+def _macd(series: pd.Series):
+    fast = _ema(series, 12); slow = _ema(series, 26)
+    macd_line = fast - slow; signal = _ema(macd_line, 9)
+    return macd_line, signal, macd_line - signal
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_tsla_technicals(period: str = "3mo") -> dict:
+    """
+    Fetch TSLA OHLCV + compute EMA20/50/200, ATR14, RSI14, MACD, key levels.
+    Returns dict with all values needed for render_tsla_tech_panel().
+    """
+    try:
+        df = yf.download("TSLA", period=period, interval="1d",
+                         progress=False, auto_adjust=True)
+        if df.empty: raise ValueError("Empty dataframe")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna(subset=["Close","High","Low","Open","Volume"])
+
+        close  = df["Close"]
+        high   = df["High"]
+        low    = df["Low"]
+
+        # EMAs
+        ema20  = _ema(close, 20)
+        ema50  = _ema(close, 50)
+        ema200 = _ema(close, 200)
+
+        # ATR
+        atr14  = _atr(df, 14)
+
+        # RSI
+        rsi14  = _rsi(close, 14)
+
+        # MACD
+        macd_line, macd_sig, macd_hist = _macd(close)
+
+        # Current values
+        price    = float(close.iloc[-1])
+        prev     = float(close.iloc[-2]) if len(close) >= 2 else price
+        atr_val  = float(atr14.iloc[-1])
+        rsi_val  = float(rsi14.iloc[-1])
+        e20      = float(ema20.iloc[-1])
+        e50      = float(ema50.iloc[-1])
+        e200     = float(ema200.iloc[-1])
+        macd_v   = float(macd_line.iloc[-1])
+        macd_s   = float(macd_sig.iloc[-1])
+        macd_h   = float(macd_hist.iloc[-1])
+
+        # Key levels: recent highs/lows (20-day swing)
+        recent   = df.tail(20)
+        r20h     = float(recent["High"].max())
+        r20l     = float(recent["Low"].min())
+        r5h      = float(df.tail(5)["High"].max())
+        r5l      = float(df.tail(5)["Low"].min())
+
+        # Gap detection: today open vs yesterday close
+        today_open = float(df["Open"].iloc[-1])
+        gap_pct    = (today_open - prev) / prev * 100 if prev else 0
+
+        # ATR-based zones
+        atr_stop_long  = price - 1.5 * atr_val   # 1.5x ATR below price
+        atr_stop_short = price + 1.5 * atr_val
+        atr_target1    = price + 2.0 * atr_val
+        atr_target2    = price + 3.5 * atr_val
+
+        # EMA alignment signal
+        bull_align = price > e20 > e50       # price above EMA20 > EMA50
+        bear_align = price < e20 < e50
+        ema200_above = price > e200
+
+        # ATR compression: current ATR vs 20-day avg ATR
+        atr_20avg = float(atr14.tail(20).mean())
+        atr_ratio = atr_val / atr_20avg if atr_20avg > 0 else 1.0
+
+        # Volume spike
+        vol_today  = float(df["Volume"].iloc[-1])
+        vol_20avg  = float(df["Volume"].tail(20).mean())
+        vol_ratio  = vol_today / vol_20avg if vol_20avg > 0 else 1.0
+
+        return dict(
+            price=price, prev=prev, atr=atr_val, rsi=rsi_val,
+            e20=e20, e50=e50, e200=e200,
+            macd=macd_v, macd_sig=macd_s, macd_hist=macd_h,
+            r20h=r20h, r20l=r20l, r5h=r5h, r5l=r5l,
+            gap_pct=gap_pct, today_open=today_open,
+            atr_stop_long=atr_stop_long, atr_stop_short=atr_stop_short,
+            atr_target1=atr_target1, atr_target2=atr_target2,
+            bull_align=bull_align, bear_align=bear_align, ema200_above=ema200_above,
+            atr_ratio=atr_ratio, vol_ratio=vol_ratio,
+            error=None,
+        )
+    except Exception as e:
+        return dict(error=str(e))
+
+
+def _tech_signal_summary(t: dict, shares: int) -> list[str]:
+    """Generate trading signal bullets from technicals dict."""
+    lines = []
+    price = t["price"]
+
+    # 1. EMA alignment
+    if t["bull_align"]:
+        lines.append(f"✅ EMA對齊看多：價格({fmt_num(price)}) > EMA20({fmt_num(t['e20'])}) > EMA50({fmt_num(t['e50'])})")
+    elif t["bear_align"]:
+        lines.append(f"🔴 EMA對齊看空：價格({fmt_num(price)}) < EMA20({fmt_num(t['e20'])}) < EMA50({fmt_num(t['e50'])})")
+    else:
+        lines.append(f"⚠️ EMA混亂：無明確方向 — E20 {fmt_num(t['e20'])} / E50 {fmt_num(t['e50'])}")
+
+    # 2. RSI
+    rsi = t["rsi"]
+    if   rsi >= 75: lines.append(f"🔴 RSI {rsi:.1f} — 超買，注意回調風險")
+    elif rsi >= 60: lines.append(f"🟡 RSI {rsi:.1f} — 偏強，動能持續但注意高位")
+    elif rsi <= 30: lines.append(f"✅ RSI {rsi:.1f} — 超賣，反彈機會")
+    elif rsi <= 45: lines.append(f"🟡 RSI {rsi:.1f} — 偏弱，逢高沽壓")
+    else:           lines.append(f"◆ RSI {rsi:.1f} — 中性區間")
+
+    # 3. MACD
+    if t["macd_hist"] > 0 and t["macd"] > t["macd_sig"]:
+        lines.append(f"✅ MACD 金叉 ({t['macd']:.3f} > {t['macd_sig']:.3f}) — 動能看多")
+    elif t["macd_hist"] < 0 and t["macd"] < t["macd_sig"]:
+        lines.append(f"🔴 MACD 死叉 ({t['macd']:.3f} < {t['macd_sig']:.3f}) — 動能看空")
+    else:
+        lines.append(f"◆ MACD 收斂中 ({t['macd']:.3f} / {t['macd_sig']:.3f})")
+
+    # 4. ATR compression
+    if t["atr_ratio"] < 0.7:
+        lines.append(f"⚡ ATR壓縮 ({t['atr_ratio']:.2f}x均值) — 蓄勢待發，注意方向突破")
+    elif t["atr_ratio"] > 1.5:
+        lines.append(f"🌊 ATR擴張 ({t['atr_ratio']:.2f}x均值) — 高波動，嚴控倉位")
+
+    # 5. Volume
+    if t["vol_ratio"] > 2.0:
+        lines.append(f"📊 成交量異常 {t['vol_ratio']:.1f}x均量 — 機構參與，方向可信")
+    elif t["vol_ratio"] > 1.5:
+        lines.append(f"📊 成交量偏高 {t['vol_ratio']:.1f}x均量")
+
+    # 6. ATR trade setup
+    atr = t["atr"]
+    lines.append(
+        f"📐 ATR=${atr:.2f} | "
+        f"多單止損 ${t['atr_stop_long']:.2f} | "
+        f"目標① ${t['atr_target1']:.2f} ② ${t['atr_target2']:.2f}"
+    )
+    if shares > 0:
+        risk_per_share = price - t["atr_stop_long"]
+        total_risk = risk_per_share * shares
+        lines.append(f"💰 {shares}股風險敞口：每股 ${risk_per_share:.2f} · 總風險 ${total_risk:,.0f}")
+
+    return lines
+
+
+def render_tsla_tech_panel():
+    st.markdown('<div class="section-label">▸ 📐 TSLA 技術分析 · 關鍵位與交易設定</div>',
+                unsafe_allow_html=True)
+    period = st.session_state.get("tech_period", "3mo")
+    t = fetch_tsla_technicals(period)
+
+    if t.get("error"):
+        st.error(f"技術數據載入失敗：{t['error']}")
+        return
+
+    price = t["price"]
+    gap_pct = t["gap_pct"]
+    gap_html = ""
+    if abs(gap_pct) > 0.3:
+        g_cls = "gap-up" if gap_pct > 0 else "gap-down"
+        g_sym = "↑" if gap_pct > 0 else "↓"
+        gap_html = f'<span class="gap-badge {g_cls}">{g_sym}缺口 {gap_pct:+.2f}%</span>'
+
+    # ── Header ──
+    now_lbl = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+    header = (
+        '<div class="tech-wrap">'
+        '<div class="tech-header">'
+        '<div>'
+        '<div class="tech-title">📐 TSLA · 技術關鍵位</div>'
+        f'<div style="font-family:var(--mono,monospace);font-size:.6rem;color:var(--muted)">{now_lbl} · {period}</div>'
+        '</div>'
+        f'<div class="tech-price {cc(price - t["prev"])}">'
+        f'${fmt_num(price)}{gap_html}'
+        '</div>'
+        '</div>'
+    )
+
+    # ── EMA / ATR / RSI cards ──
+    e20_cls  = "active" if price > t["e20"]  else "warn"
+    e50_cls  = "active" if price > t["e50"]  else "warn"
+    e200_cls = "active" if price > t["e200"] else "warn"
+    rsi_cls  = "warn" if t["rsi"] >= 75 or t["rsi"] <= 30 else "active" if 50 < t["rsi"] < 70 else ""
+    macd_cls = "active" if t["macd_hist"] > 0 else "warn"
+
+    grid = '<div class="tech-grid">'
+    def _card(label, val, sub, cls=""):
+        return (f'<div class="tech-card {cls}">'
+                f'<div class="tech-clabel">{label}</div>'
+                f'<div class="tech-cval">{val}</div>'
+                f'<div class="tech-csub">{sub}</div>'
+                f'</div>')
+
+    grid += _card("EMA 20", f"${fmt_num(t['e20'])}",
+                  "↑多" if price>t['e20'] else "↓空", e20_cls)
+    grid += _card("EMA 50", f"${fmt_num(t['e50'])}",
+                  "↑多" if price>t['e50'] else "↓空", e50_cls)
+    grid += _card("EMA 200", f"${fmt_num(t['e200'])}",
+                  "牛市線上" if price>t['e200'] else "熊市線下", e200_cls)
+    grid += _card("ATR 14", f"${t['atr']:.2f}",
+                  f"{t['atr_ratio']:.1f}x均值 {'壓縮' if t['atr_ratio']<0.8 else '擴張' if t['atr_ratio']>1.4 else '正常'}")
+    grid += _card("RSI 14", f"{t['rsi']:.1f}",
+                  "超買" if t['rsi']>=75 else "超賣" if t['rsi']<=30 else "中性", rsi_cls)
+    grid += _card("MACD", f"{t['macd']:.3f}",
+                  f"{'金叉▲' if t['macd']>t['macd_sig'] else '死叉▼'} Hist {t['macd_hist']:.3f}", macd_cls)
+    grid += '</div>'
+
+    # ── Key levels table ──
+    levels_html = '<div style="margin:.5rem 0">'
+    levels = [
+        ("🔴 阻力②",  t['r20h'],          "20日最高/供應區",    "down"),
+        ("🔴 阻力①",  t['r5h'],           "5日高點",           "down"),
+        ("◆ EMA20",   t['e20'],           "短期均線",           "flat"),
+        ("◆ EMA50",   t['e50'],           "中期均線",           "flat"),
+        ("✅ 支撐①",  t['r5l'],           "5日低點",           "up"),
+        ("✅ 支撐②",  t['r20l'],          "20日最低/需求區",    "up"),
+        ("📐 ATR止損", t['atr_stop_long'], "1.5×ATR多單止損",   "down"),
+        ("🎯 目標①",  t['atr_target1'],   "2×ATR目標",         "up"),
+        ("🎯 目標②",  t['atr_target2'],   "3.5×ATR目標",       "up"),
+    ]
+    # sort by price descending to show natural level ladder
+    levels.sort(key=lambda x: x[1], reverse=True)
+
+    for lbl, lvl, zone, col in levels:
+        dist = (lvl - price) / price * 100
+        dist_str = f"{dist:+.2f}%"
+        # highlight current price between levels
+        is_near = abs(dist) < 0.5
+        bg_style = "background:var(--flat-bg);" if is_near else ""
+        levels_html += (
+            f'<div class="level-row" style="{bg_style}">'
+            f'<span class="level-label">{lbl}</span>'
+            f'<span class="tech-cval {col}">${fmt_num(lvl)}</span>'
+            f'<span class="{col}" style="font-size:.68rem">{dist_str}</span>'
+            f'<span class="level-zone">{zone}</span>'
+            f'</div>'
+        )
+    levels_html += '</div>'
+
+    # ── Signal summary ──
+    shares = st.session_state.get("tsla_shares", 100)
+    signals = _tech_signal_summary(t, shares)
+    sig_html = '<div class="signal-row">' + "<br>".join(signals) + '</div>'
+
+    st.markdown(header + grid + levels_html + sig_html + '</div>',
+                unsafe_allow_html=True)
+    return t  # return for Telegram use
+
+
+# ── Telegram Push System ───────────────────────────────────────────────────────
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
+    """Send a Telegram message. Returns True on success."""
+    if not token or not chat_id: return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=8)
+        return r.json().get("ok", False)
+    except Exception:
+        return False
+
+def _tg_dedup(text: str) -> str:
+    """Return MD5 hash of text for deduplication."""
+    import hashlib
+    return hashlib.md5(text.encode()).hexdigest()[:12]
+
+def _should_send(msg_hash: str) -> bool:
+    hashes = st.session_state.get("tg_sent_hashes", set())
+    if msg_hash in hashes: return False
+    hashes.add(msg_hash)
+    st.session_state["tg_sent_hashes"] = hashes
+    return True
+
+def check_and_push_alerts(
+    token: str, chat_id: str,
+    tsla_data: dict, vix_data: dict,
+    yield_data: dict, sector_data: list,
+    tech_data: dict | None = None,
+) -> list[str]:
+    """
+    Check all alert conditions and push Telegram messages.
+    Returns list of sent message summaries (for UI log).
+    """
+    if not token or not chat_id: return []
+    sent_log = []
+    et_now   = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+    thr_vix  = st.session_state.get("tg_vix_threshold", 25.0)
+    thr_tsla = st.session_state.get("tg_tsla_pct_threshold", 3.0)
+    thr_y10  = st.session_state.get("tg_yield_threshold", 4.5)
+
+    def _push(msg: str, emoji: str = "📡"):
+        h = _tg_dedup(msg)
+        if _should_send(h):
+            full = f"{emoji} <b>Fortune Pre-Market</b> · {et_now}\n\n{msg}"
+            if _tg_send(token, chat_id, full):
+                sent_log.append(msg[:60] + "…" if len(msg) > 60 else msg)
+
+    # ── 1. TSLA price alerts (user-defined) ──
+    if tsla_data and not tsla_data.get("error"):
+        et_t = datetime.now(pytz.timezone("America/New_York")).time()
+        _is_pre = time(4,0) <= et_t < time(9,30)
+        cur_price = tsla_data.get("pre_price") if _is_pre else tsla_data.get("price")
+        if cur_price:
+            for a in st.session_state.get("price_alerts", []):
+                if a["ticker"].upper() != "TSLA": continue
+                tgt = a["price"]
+                if a["direction"] == "突破上方" and cur_price >= tgt:
+                    _push(f"🚀 TSLA 突破 <b>${tgt:.2f}</b>！\n現價：<b>${cur_price:.2f}</b>", "🚨")
+                elif a["direction"] == "跌破下方" and cur_price <= tgt:
+                    _push(f"⚠️ TSLA 跌破 <b>${tgt:.2f}</b>！\n現價：<b>${cur_price:.2f}</b>", "🚨")
+
+    # ── 2. TSLA pre-market big move ──
+    if tsla_data and not tsla_data.get("error"):
+        pct = tsla_data.get("pre_pct") or tsla_data.get("reg_pct")
+        price = tsla_data.get("pre_price") or tsla_data.get("price")
+        if pct is not None and abs(pct) >= thr_tsla:
+            direction = "急升 🚀" if pct > 0 else "急跌 🔴"
+            _push(
+                f"TSLA {direction} <b>{pct:+.2f}%</b>\n"
+                f"現價：<b>${fmt_num(price)}</b>\n"
+                f"閾值：±{thr_tsla:.1f}%",
+                "🚨"
+            )
+
+    # ── 3. VIX spike ──
+    if vix_data and not vix_data.get("error"):
+        vix = vix_data.get("price")
+        if vix and vix >= thr_vix:
+            _push(
+                f"VIX 恐慌指數 <b>{vix:.2f}</b> ≥ {thr_vix:.0f}\n"
+                f"市場恐慌升溫，注意風險管理",
+                "😱"
+            )
+
+    # ── 4. 10Y yield threshold ──
+    if yield_data:
+        y10 = yield_data.get("^TNX", {})
+        if not y10.get("error") and y10.get("value"):
+            val = y10["value"]
+            if val >= thr_y10:
+                bp  = y10.get("bp", 0)
+                _push(
+                    f"10年期美債殖利率 <b>{val:.3f}%</b> ≥ {thr_y10:.1f}%\n"
+                    f"今日變動：{bp:+.1f}bp — 科技股估值承壓",
+                    "🏦"
+                )
+
+    # ── 5. Extreme sector rotation ──
+    if sector_data:
+        valid = [s for s in sector_data if not s.get("error") and s.get("pct") is not None]
+        if len(valid) >= 2:
+            top    = valid[0];  bot = valid[-1]
+            spread = (top["pct"] or 0) - (bot["pct"] or 0)
+            if spread >= 3.0:
+                _push(
+                    f"板塊極端輪動 (差距 {spread:.1f}%)\n"
+                    f"領漲：{top['name_zh']}({top['ticker']}) {fmt_pct(top['pct'])}\n"
+                    f"落後：{bot['name_zh']}({bot['ticker']}) {fmt_pct(bot['pct'])}",
+                    "🔄"
+                )
+
+    # ── 6. ATR compression breakout (if tech data available) ──
+    if tech_data and not tech_data.get("error"):
+        if tech_data.get("atr_ratio", 1) < 0.65:
+            atr = tech_data["atr"]
+            _push(
+                f"TSLA ATR壓縮 ({tech_data['atr_ratio']:.2f}x均值)\n"
+                f"ATR=${atr:.2f} — 蓄勢待發，注意方向突破\n"
+                f"突破上方 ${tech_data['atr_target1']:.2f} / 下方 ${tech_data['atr_stop_long']:.2f}",
+                "⚡"
+            )
+
+    return sent_log
+
+
+def render_telegram_panel(tsla_data, vix_data, yield_data, sector_data, tech_data=None):
+    """Render Telegram push log in sidebar — call after all data fetched."""
+    if not st.session_state.get("tg_token") or not st.session_state.get("tg_chat_id"):
+        return
+
+    log = check_and_push_alerts(
+        st.session_state["tg_token"],
+        st.session_state["tg_chat_id"],
+        tsla_data, vix_data, yield_data, sector_data, tech_data
+    )
+    if log:
+        html = '<div class="tg-log">'
+        now  = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M")
+        for item in log:
+            html += f'<div class="tg-log-item">📤 {now} — {_html.escape(item)}</div>'
+        html += '</div>'
+        st.markdown(
+            f'<div class="section-label">▸ 📲 Telegram 推送記錄</div>'
+            f'<div class="tg-panel">{html}</div>',
+            unsafe_allow_html=True)
+
+
+
 # ── News intel panel ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_news(query: str, serper_key: str, cache_buster: int = 0) -> list:
@@ -1391,6 +1865,22 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
     except Exception:
         sector_lines = "N/A"
 
+    # Add TSLA tech data to prompt if available
+    tech_lines = ""
+    try:
+        _t = fetch_tsla_technicals(st.session_state.get("tech_period","3mo"))
+        if not _t.get("error"):
+            tech_lines = (
+                f"EMA20=${fmt_num(_t['e20'])} EMA50=${fmt_num(_t['e50'])} EMA200=${fmt_num(_t['e200'])} | "
+                f"ATR=${_t['atr']:.2f}({_t['atr_ratio']:.1f}x) | "
+                f"RSI={_t['rsi']:.1f} | "
+                f"{'多頭對齊' if _t['bull_align'] else '空頭對齊' if _t['bear_align'] else 'EMA混亂'} | "
+                f"MACD {'金叉' if _t['macd']>_t['macd_sig'] else '死叉'} | "
+                f"止損=${_t['atr_stop_long']:.2f} 目標①=${_t['atr_target1']:.2f}"
+            )
+    except Exception:
+        tech_lines = "N/A"
+
     return f"""# 美股即時分析請求
 日期：{today_str}  時間：{fetch_time}  時段：{session}  數據抓取：{fetch_time}
 
@@ -1410,11 +1900,12 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
 | Brent 原油 | {brent_str} |
 | 美債殖利率 | {yield_lines} |
 | 板塊輪動 | {sector_lines} |
+| TSLA技術 | {tech_lines} |
 
 ## 請幫我分析：
 1. **今日最大風險/機會**是什麼？對 TSLA 和納指方向的影響？
 2. **油價{wti_dir} {wti_str}** 對今日科技股有何具體影響？
-3. **TSLA 今日交易策略**：建議入場區間、止損位、目標位（$數字）？
+3. **TSLA 今日交易策略**：根據上方技術數據，建議具體入場區間、止損位（參考ATR止損）、目標位（$數字）？
 4. **VIX {vix_val}** 顯示市場情緒如何？適合做多/做空/觀望？
 5. 今日最需要關注的**時間點**（數據發布/官員講話/峰會消息）？
 
@@ -1470,6 +1961,44 @@ def main():
         st.session_state.groq_key = gk
 
         st.markdown("---")
+        st.markdown("### 📲 Telegram 推送")
+        tg_tok = st.text_input("Bot Token", value=st.session_state.tg_token,
+                               type="password", placeholder="從 @BotFather 獲取")
+        st.session_state.tg_token = tg_tok
+        tg_cid = st.text_input("Chat ID", value=st.session_state.tg_chat_id,
+                               placeholder="你的 chat_id 或群組 id")
+        st.session_state.tg_chat_id = tg_cid
+        if tg_tok and tg_cid:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.session_state.tg_vix_threshold = st.number_input(
+                    "VIX閾值", value=float(st.session_state.tg_vix_threshold),
+                    min_value=15.0, max_value=50.0, step=0.5, format="%.1f")
+            with c2:
+                st.session_state.tg_tsla_pct_threshold = st.number_input(
+                    "TSLA±%", value=float(st.session_state.tg_tsla_pct_threshold),
+                    min_value=1.0, max_value=10.0, step=0.5, format="%.1f")
+            with c3:
+                st.session_state.tg_yield_threshold = st.number_input(
+                    "10Y殖利率%", value=float(st.session_state.tg_yield_threshold),
+                    min_value=3.0, max_value=6.0, step=0.1, format="%.1f")
+            if st.button("🔔 測試推送"):
+                _test_msg = "✅ <b>Fortune Pre-Market Monitor</b> Telegram 連接成功！推送系統已就緒。"
+                ok = _tg_send(tg_tok, tg_cid, _test_msg)
+                st.success("推送成功！") if ok else st.error("推送失敗，請檢查 Token/Chat ID")
+
+        st.markdown("---")
+        st.markdown("### 📐 技術分析設定")
+        st.session_state.tsla_shares = st.number_input(
+            "TSLA 持股數（風險計算）",
+            value=int(st.session_state.tsla_shares),
+            min_value=0, max_value=10000, step=10)
+        st.session_state.tech_period = st.selectbox(
+            "技術分析週期",
+            ["1mo","3mo","6mo","1y"], index=1,
+            format_func=lambda x: {"1mo":"1個月","3mo":"3個月","6mo":"6個月","1y":"1年"}[x])
+
+        st.markdown("---")
         render_alert_manager()
 
         st.markdown("---")
@@ -1480,6 +2009,7 @@ def main():
 
         st.markdown("---")
         st.markdown("### 顯示選項")
+        show_tech    = st.checkbox("TSLA技術分析",   value=True)
         show_futures = st.checkbox("期貨代理",      value=True)
         show_vix     = st.checkbox("波動/恐慌",     value=True)
         show_lev     = st.checkbox("槓桿ETF",       value=False)
@@ -1686,6 +2216,11 @@ function onSuccess() {{
             f"US China trade tariff Taiwan semiconductor TSLA Shanghai {_today}",
             sk, gk, "🌏")
 
+    # ── TSLA Technical Panel ─────────────────────────────────────────────────
+    tech_result = None
+    if show_tech:
+        tech_result = render_tsla_tech_panel()
+
     # ── Quick metrics bar ─────────────────────────────────────────────────────
     st.markdown('<div class="section-label">▸ 快速指標</div>', unsafe_allow_html=True)
     vd = fetch_quote("^VIX"); sd = fetch_quote("SPY")
@@ -1724,6 +2259,12 @@ function onSuccess() {{
     mini(m3, f"QQQ {qlbl}%", fmt_pct(qp), f"收盤 {fmt_num(qd.get('price'))}", cc(qp))
     tp, _, tlbl = best_pct(td)
     mini(m4, f"TSLA {tlbl}%", fmt_pct(tp), f"收盤 {fmt_num(td.get('price'))}", cc(tp))
+
+    # ── Telegram push (runs every refresh cycle) ─────────────────────────────
+    if st.session_state.get("tg_token") and st.session_state.get("tg_chat_id"):
+        _yield_data = fetch_yields() if show_yield else {}
+        _sector_data = fetch_sectors() if show_sector else []
+        render_telegram_panel(td, vd, _yield_data, _sector_data, tech_result)
 
     # ── Footer ────────────────────────────────────────────────────────────────
     next_refresh = f" · ⏱ 自動刷新每 {st.session_state.refresh_interval}s" if st.session_state.auto_refresh else ""
