@@ -317,6 +317,34 @@ def inject_css():
     .tg-log-item{{padding:.12rem 0;border-bottom:1px dotted var(--border);}}
     .tg-log-item:last-child{{border-bottom:none;}}
 
+    /* DXY + BTC PANEL */
+    .macro-lead-wrap{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.9rem 1.1rem;margin-bottom:.5rem;}}
+    .macro-lead-header{{display:flex;justify-content:space-between;align-items:center;
+        margin-bottom:.7rem;padding-bottom:.38rem;border-bottom:1px solid var(--border);}}
+    .macro-lead-title{{font-family:var(--mono);font-size:.72rem;font-weight:600;
+        letter-spacing:.08em;color:var(--accent);text-transform:uppercase;}}
+    .macro-lead-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;margin-bottom:.5rem;}}
+    .macro-card{{background:var(--bg);border:1px solid var(--border);border-radius:5px;
+        padding:.7rem .9rem;text-align:center;position:relative;overflow:hidden;}}
+    .macro-card.risk-off{{border-color:var(--down);box-shadow:0 0 0 1px var(--down-bg);}}
+    .macro-card.risk-on{{border-color:var(--up);box-shadow:0 0 0 1px var(--up-bg);}}
+    .macro-clabel{{font-family:var(--mono);font-size:.56rem;letter-spacing:.12em;
+        text-transform:uppercase;color:var(--muted);margin-bottom:.18rem;}}
+    .macro-cval{{font-family:var(--mono);font-size:1.15rem;font-weight:700;}}
+    .macro-chg{{font-family:var(--mono);font-size:.68rem;margin-top:.06rem;}}
+    .macro-meta{{font-family:var(--mono);font-size:.58rem;color:var(--muted);
+        margin-top:.22rem;padding-top:.22rem;border-top:1px dotted var(--border);}}
+    .macro-corr-badge{{position:absolute;top:.35rem;right:.45rem;font-family:var(--mono);
+        font-size:.52rem;font-weight:700;padding:.08rem .32rem;border-radius:2px;}}
+    .corr-inv{{background:var(--down-bg);color:var(--down);}}
+    .corr-pos{{background:var(--up-bg);color:var(--up);}}
+    .macro-signal{{font-family:var(--sans);font-size:.76rem;line-height:1.65;
+        padding:.5rem .85rem;border-radius:5px;border-left:3px solid var(--border);}}
+    .macro-divider{{height:1px;background:var(--border);margin:.45rem 0;}}
+    .macro-spark{{font-family:var(--mono);font-size:.58rem;color:var(--muted);
+        margin-top:.1rem;letter-spacing:.02em;}}
+
     .oil-card{{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.75rem 1rem;}}
     .oil-label{{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.22rem;}}
     .oil-price{{font-family:var(--mono);font-size:1.28rem;font-weight:600;}}
@@ -1572,6 +1600,318 @@ def render_tsla_tech_panel():
 
 
 
+
+# ── #7 DXY + BTC先行指標面板 ──────────────────────────────────────────────────
+MACRO_LEAD_TICKERS = {
+    "DX=F":   {"label":"DXY 美元",  "unit":"指數",    "corr":"反向",  "corr_cls":"corr-inv",
+               "note":"美元強 → 風險資產承壓"},
+    "BTC-USD":{"label":"BTC 比特幣","unit":"USD",     "corr":"正向",  "corr_cls":"corr-pos",
+               "note":"BTC領先大市15-30分鐘"},
+    "GC=F":   {"label":"黃金",      "unit":"USD/盎司","corr":"反向",  "corr_cls":"corr-inv",
+               "note":"避險需求指標"},
+    "SI=F":   {"label":"白銀",      "unit":"USD/盎司","corr":"混合",  "corr_cls":"",
+               "note":"工業+避險雙重屬性"},
+}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_macro_leads() -> dict:
+    """
+    Fetch DXY, BTC, Gold, Silver with pre/post market awareness.
+    Returns normalised dict per ticker with spark (5-day intraday trend chars).
+    """
+    et_t   = datetime.now(pytz.timezone("America/New_York")).time()
+    is_pre = time(4, 0) <= et_t < time(9, 30)
+    results = {}
+
+    for ticker, meta in MACRO_LEAD_TICKERS.items():
+        d = None
+        # Layer 1: chart API (best for real-time + pre-market)
+        try:
+            d = _yahoo_chart_api(ticker)
+        except Exception:
+            pass
+
+        # Layer 2: yf.download daily fallback
+        if d is None or d.get("error") or not d.get("price"):
+            try:
+                df = yf.download(ticker, period="7d", interval="1d",
+                                 progress=False, auto_adjust=True)
+                if not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    price = float(df["Close"].iloc[-1])
+                    prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
+                    d = dict(price=price, prev=prev,
+                             reg_chg=price - prev,
+                             reg_pct=(price - prev) / prev * 100 if prev else None,
+                             pre_price=None, pre_pct=None,
+                             high=float(df["High"].iloc[-1]) if "High" in df.columns else None,
+                             low =float(df["Low"].iloc[-1])  if "Low"  in df.columns else None,
+                             error=None)
+            except Exception:
+                pass
+
+        if d is None or d.get("error"):
+            results[ticker] = dict(meta=meta, error="載入失敗")
+            continue
+
+        # Pick best price + pct for current session
+        if is_pre and d.get("pre_price") and d.get("pre_pct") is not None:
+            disp_price = d["pre_price"]
+            disp_pct   = d["pre_pct"]
+            session_lbl = "盤前"
+        elif d.get("price") and d.get("reg_pct") is not None:
+            disp_price = d["price"]
+            disp_pct   = d["reg_pct"]
+            session_lbl = "即時" if ticker in ("BTC-USD",) else "收盤"
+        else:
+            disp_price = d.get("price") or d.get("prev")
+            disp_pct   = None
+            session_lbl = "—"
+
+        # 5-day spark: fetch daily closes for mini trend chars
+        spark = ""
+        try:
+            df5 = yf.download(ticker, period="6d", interval="1d",
+                              progress=False, auto_adjust=True)
+            if not df5.empty:
+                if isinstance(df5.columns, pd.MultiIndex):
+                    df5.columns = df5.columns.get_level_values(0)
+                closes = df5["Close"].dropna().tolist()[-5:]
+                # Build spark string: ▁▂▃▄▅▆▇█ based on relative position
+                if len(closes) >= 2:
+                    lo, hi = min(closes), max(closes)
+                    rng = hi - lo or 1
+                    bars = "▁▂▃▄▅▆▇█"
+                    spark = "".join(bars[min(7, int((c - lo) / rng * 7))] for c in closes)
+        except Exception:
+            spark = ""
+
+        results[ticker] = dict(
+            meta        = meta,
+            price       = disp_price,
+            pct         = disp_pct,
+            prev        = d.get("prev"),
+            high        = d.get("high"),
+            low         = d.get("low"),
+            session_lbl = session_lbl,
+            spark       = spark,
+            error       = None,
+        )
+    return results
+
+
+def _macro_risk_signal(dxy: dict, btc: dict, gold: dict) -> tuple[str, str, str]:
+    """
+    Synthesise DXY + BTC + Gold into a unified risk-on/off signal.
+    Returns (signal_html, bg_color, border_color).
+    """
+    dxy_pct  = dxy.get("pct")  if dxy  and not dxy.get("error")  else None
+    btc_pct  = btc.get("pct")  if btc  and not btc.get("error")  else None
+    gold_pct = gold.get("pct") if gold and not gold.get("error") else None
+    dxy_p    = dxy.get("price") if dxy  else None
+
+    parts = []
+
+    # ── DXY absolute level ──
+    if dxy_p:
+        if dxy_p >= 106:
+            parts.append(f"DXY {dxy_p:.2f} 偏強水平，風險資產整體承壓")
+        elif dxy_p <= 100:
+            parts.append(f"DXY {dxy_p:.2f} 偏弱水平，利好風險資產及黃金")
+
+    # ── Composite risk-on/off scoring ──
+    score = 0   # positive = risk-on, negative = risk-off
+    signals = []
+
+    if dxy_pct is not None:
+        if dxy_pct >= 0.5:
+            score -= 2
+            signals.append(f"DXY {dxy_pct:+.2f}% ↑ 美元走強，科技/TSLA承壓")
+        elif dxy_pct <= -0.5:
+            score += 2
+            signals.append(f"DXY {dxy_pct:+.2f}% ↓ 美元走弱，利好成長股")
+
+    if btc_pct is not None:
+        if btc_pct >= 2.0:
+            score += 2
+            signals.append(f"BTC {btc_pct:+.2f}% ↑ 加密領漲，Risk-On情緒")
+        elif btc_pct >= 0.5:
+            score += 1
+            signals.append(f"BTC {btc_pct:+.2f}% ↑ 輕微Risk-On")
+        elif btc_pct <= -2.0:
+            score -= 2
+            signals.append(f"BTC {btc_pct:+.2f}% ↓ 加密下跌，Risk-Off預警")
+        elif btc_pct <= -0.5:
+            score -= 1
+            signals.append(f"BTC {btc_pct:+.2f}% ↓ 輕微Risk-Off")
+
+    if gold_pct is not None:
+        if gold_pct >= 1.0:
+            score -= 1
+            signals.append(f"黃金 {gold_pct:+.2f}% ↑ 避險需求上升")
+        elif gold_pct <= -1.0:
+            score += 1
+            signals.append(f"黃金 {gold_pct:+.2f}% ↓ 避險鬆動")
+
+    # ── Final verdict ──
+    if score >= 3:
+        verdict = "🚀 <b>強Risk-On</b> — 多項先行指標同步看多，TSLA做多信號增強"
+        bg, bc = "var(--up-bg)", "var(--up)"
+    elif score >= 1:
+        verdict = "✅ <b>溫和Risk-On</b> — 先行指標偏多，配合技術面做多"
+        bg, bc = "var(--up-bg)", "var(--up)"
+    elif score <= -3:
+        verdict = "🔴 <b>強Risk-Off</b> — 多項先行指標同步看空，謹慎做多"
+        bg, bc = "var(--down-bg)", "var(--down)"
+    elif score <= -1:
+        verdict = "⚠️ <b>溫和Risk-Off</b> — 先行指標偏空，控制倉位"
+        bg, bc = "var(--down-bg)", "var(--down)"
+    else:
+        verdict = "◆ <b>中性</b> — 先行指標無明確方向，跟隨技術面"
+        bg, bc = "var(--flat-bg)", "var(--muted)"
+
+    detail = " &nbsp;·&nbsp; ".join(signals) if signals else "先行指標變動溫和"
+    return f"{verdict}<br><span style='font-size:.7rem;color:var(--muted)'>{detail}</span>", bg, bc
+
+
+def _btc_lead_note(btc_pct: float | None) -> str:
+    """Generate BTC-specific leading indicator note."""
+    if btc_pct is None: return ""
+    et_t = datetime.now(pytz.timezone("America/New_York")).time()
+    is_pre = time(4, 0) <= et_t < time(9, 30)
+    if not is_pre: return ""   # only relevant pre-market
+    # BTC leading effect most pronounced pre-market
+    if btc_pct >= 3.0:
+        return "⚡ BTC盤前急升，通常預示科技股跟升（15-30分鐘滯後）"
+    if btc_pct >= 1.5:
+        return "📈 BTC盤前上漲，輕微看多科技板塊"
+    if btc_pct <= -3.0:
+        return "⚠️ BTC盤前急跌，留意科技股開盤承壓"
+    if btc_pct <= -1.5:
+        return "📉 BTC盤前下跌，科技股開盤略偏弱"
+    return ""
+
+
+def render_macro_lead_panel():
+    st.markdown(
+        '<div class="section-label">▸ 🌐 宏觀先行指標 · DXY美元 · BTC · 黃金</div>',
+        unsafe_allow_html=True)
+
+    with st.spinner("載入先行指標..."):
+        data = fetch_macro_leads()
+
+    now_lbl = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+    et_t    = datetime.now(pytz.timezone("America/New_York")).time()
+    is_pre  = time(4, 0) <= et_t < time(9, 30)
+
+    html = (
+        '<div class="macro-lead-wrap">'
+        '<div class="macro-lead-header">'
+        '<div class="macro-lead-title">🌐 宏觀先行指標</div>'
+        f'<div style="font-family:var(--mono,monospace);font-size:.6rem;color:var(--muted)">'
+        f'{"盤前模式 — BTC領先效應激活" if is_pre else "盤中/盤後"}'
+        f' &nbsp;·&nbsp; {now_lbl}</div>'
+        '</div>'
+        '<div class="macro-lead-grid">'
+    )
+
+    ticker_order = ["DX=F", "BTC-USD", "GC=F", "SI=F"]
+    for ticker in ticker_order:
+        d = data.get(ticker, {})
+        meta = d.get("meta", MACRO_LEAD_TICKERS.get(ticker, {}))
+
+        if d.get("error"):
+            html += (
+                f'<div class="macro-card">'
+                f'<div class="macro-clabel">{meta.get("label", ticker)}</div>'
+                f'<div class="macro-cval flat">—</div>'
+                f'<div class="macro-chg flat">{d["error"][:25]}</div>'
+                f'</div>'
+            )
+            continue
+
+        price   = d.get("price")
+        pct     = d.get("pct")
+        high    = d.get("high")
+        low     = d.get("low")
+        spark   = d.get("spark", "")
+        slbl    = d.get("session_lbl", "")
+        corr    = meta.get("corr", "")
+        corr_cls= meta.get("corr_cls", "")
+        note    = meta.get("note", "")
+        unit    = meta.get("unit", "")
+
+        col_cls = cc(pct)
+
+        # Card border: risk-off cues = DXY up / BTC down / Gold up
+        card_extra = ""
+        if ticker == "DX=F"    and (pct or 0) >= 0.5:  card_extra = "risk-off"
+        if ticker == "DX=F"    and (pct or 0) <= -0.5: card_extra = "risk-on"
+        if ticker == "BTC-USD" and (pct or 0) >= 1.5:  card_extra = "risk-on"
+        if ticker == "BTC-USD" and (pct or 0) <= -1.5: card_extra = "risk-off"
+        if ticker == "GC=F"    and (pct or 0) >= 1.0:  card_extra = "risk-off"
+
+        # Format price: BTC no decimal needed if >1000, others 2dp
+        if ticker == "BTC-USD" and price and price > 1000:
+            price_str = f"${price:,.0f}"
+        elif ticker == "DX=F":
+            price_str = f"{price:.3f}" if price else "—"
+        else:
+            price_str = f"${fmt_num(price)}"
+
+        sign = "+" if (pct or 0) >= 0 else ""
+        pct_str = f"{sign}{pct:.2f}%" if pct is not None else "—"
+
+        corr_badge = (
+            f'<span class="macro-corr-badge {corr_cls}">{corr}</span>'
+            if corr else ""
+        )
+
+        html += (
+            f'<div class="macro-card {card_extra}">'
+            f'{corr_badge}'
+            f'<div class="macro-clabel">{meta["label"]}</div>'
+            f'<div class="macro-cval {col_cls}">{price_str}</div>'
+            f'<div class="macro-chg {col_cls}">{pct_str}'
+            f'<span style="font-size:.52rem;color:var(--muted);margin-left:.3rem">[{slbl}]</span>'
+            f'</div>'
+            f'<div class="macro-meta">'
+            f'H {fmt_num(high)} · L {fmt_num(low)}'
+            f'</div>'
+            f'<div class="macro-spark">{spark}</div>'
+            f'</div>'
+        )
+
+    html += '</div>'  # close grid
+
+    # BTC leading note (pre-market only)
+    btc_d   = data.get("BTC-USD", {})
+    btc_pct = btc_d.get("pct") if not btc_d.get("error") else None
+    btc_note = _btc_lead_note(btc_pct)
+    if btc_note:
+        html += (
+            f'<div style="font-family:var(--sans,sans-serif);font-size:.74rem;'
+            f'padding:.4rem .7rem;background:var(--up-bg);border-left:3px solid var(--up);'
+            f'border-radius:0 4px 4px 0;color:var(--up);margin-bottom:.4rem">'
+            f'{btc_note}</div>'
+        )
+
+    # Unified risk signal
+    dxy_d  = data.get("DX=F",    {})
+    gold_d = data.get("GC=F",    {})
+    signal_html, bg, bc = _macro_risk_signal(dxy_d, btc_d, gold_d)
+    html += (
+        f'<div class="macro-signal" style="background:{bg};border-left-color:{bc}">'
+        f'{signal_html}'
+        f'</div>'
+        f'</div>'   # close wrap
+    )
+
+    st.markdown(html, unsafe_allow_html=True)
+
+
+
 # ── #3 TSLA vs QQQ Relative Strength ─────────────────────────────────────────
 RS_PAIRS = [
     # (ticker, label_zh, benchmark)
@@ -2291,6 +2631,28 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
     except Exception:
         sector_lines = "N/A"
 
+    # Add DXY + BTC data to prompt
+    macro_lines = ""
+    try:
+        _ml = fetch_macro_leads()
+        _parts = []
+        for _tk, _lbl in [("DX=F","DXY"),("BTC-USD","BTC"),("GC=F","黃金")]:
+            _md = _ml.get(_tk, {})
+            if not _md.get("error") and _md.get("price"):
+                _p   = _md["price"]
+                _pct = _md.get("pct")
+                _pct_s = f"{_pct:+.2f}%" if _pct is not None else "—"
+                if _tk == "BTC-USD" and _p > 1000:
+                    _pstr = f"${_p:,.0f}"
+                elif _tk == "DX=F":
+                    _pstr = f"{_p:.3f}"
+                else:
+                    _pstr = f"${fmt_num(_p)}"
+                _parts.append(f"{_lbl} {_pstr}({_pct_s})")
+        macro_lines = " | ".join(_parts)
+    except Exception:
+        macro_lines = "N/A"
+
     # Add RS data to prompt
     rs_lines = ""
     try:
@@ -2358,12 +2720,13 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
 | Brent 原油 | {brent_str} |
 | 美債殖利率 | {yield_lines} |
 | 板塊輪動 | {sector_lines} |
+| 宏觀先行 | {macro_lines} |
 | 相對強弱 | {rs_lines} |
 | Put/Call | {pc_lines} |
 | TSLA技術 | {tech_lines} |
 
 ## 請幫我分析：
-1. **今日最大風險/機會**是什麼？對 TSLA 和納指方向的影響？
+1. **今日最大風險/機會**是什麼？結合DXY/BTC先行指標，對 TSLA 和納指方向的影響？
 2. **油價{wti_dir} {wti_str}** 對今日科技股有何具體影響？
 3. **TSLA 今日交易策略**：根據上方技術數據，建議具體入場區間、止損位（參考ATR止損）、目標位（$數字）？
 4. **VIX {vix_val}** 顯示市場情緒如何？適合做多/做空/觀望？
@@ -2469,6 +2832,7 @@ def main():
 
         st.markdown("---")
         st.markdown("### 顯示選項")
+        show_macro   = st.checkbox("DXY/BTC先行",    value=True)
         show_rs      = st.checkbox("TSLA相對強弱",   value=True)
         show_pc      = st.checkbox("Put/Call Ratio", value=True)
         show_tech    = st.checkbox("TSLA技術分析",   value=True)
@@ -2650,6 +3014,10 @@ function onSuccess() {{
     if show_sector:
         render_sector_panel()
 
+    # ── Macro Lead Indicators (DXY + BTC + Gold) ────────────────────────────
+    if show_macro:
+        render_macro_lead_panel()
+
     # ── Fear & Greed ──────────────────────────────────────────────────────────
     if show_fg:
         st.markdown('<div class="section-label">▸ 😱 市場情緒指標</div>', unsafe_allow_html=True)
@@ -2732,8 +3100,35 @@ function onSuccess() {{
 
     # ── Telegram push (runs every refresh cycle) ─────────────────────────────
     if st.session_state.get("tg_token") and st.session_state.get("tg_chat_id"):
-        _yield_data = fetch_yields() if show_yield else {}
+        _yield_data  = fetch_yields()  if show_yield  else {}
         _sector_data = fetch_sectors() if show_sector else []
+        # Also check DXY extreme move for Telegram alert
+        if show_macro:
+            _macro_data = fetch_macro_leads()
+            _dxy = _macro_data.get("DX=F", {})
+            _btc = _macro_data.get("BTC-USD", {})
+            _dxy_pct = _dxy.get("pct")
+            _btc_pct = _btc.get("pct")
+            if _dxy_pct is not None and abs(_dxy_pct) >= 0.8:
+                _dir = "急升" if _dxy_pct > 0 else "急跌"
+                _dxy_price = _dxy.get('price', 0)
+                _dxy_note  = "⚠️ 美元走強，風險資產承壓" if _dxy_pct > 0 else "✅ 美元走弱，利好成長股"
+                _msg = f"DXY 美元指數{_dir} {_dxy_pct:+.2f}% 現值：{_dxy_price:.3f} {_dxy_note}"
+                import hashlib as _hl
+                _h = _hl.md5(_msg.encode()).hexdigest()[:12]
+                if _should_send(_h):
+                    _tg_send(st.session_state["tg_token"], st.session_state["tg_chat_id"],
+                             "🌐 <b>Fortune Pre-Market</b>\n\n" + _msg)
+            if _btc_pct is not None and abs(_btc_pct) >= 3.0:
+                _dir = "急升" if _btc_pct > 0 else "急跌"
+                _btc_price = _btc.get('price', 0)
+                _btc_note  = "📈 盤前風險情緒改善，留意科技股跟升" if _btc_pct > 0 else "📉 加密下跌，盤前風險情緒偏弱"
+                _msg = f"BTC {_dir} {_btc_pct:+.2f}% 現價：${_btc_price:,.0f} {_btc_note}"
+                import hashlib as _hl2
+                _h2 = _hl2.md5(_msg.encode()).hexdigest()[:12]
+                if _should_send(_h2):
+                    _tg_send(st.session_state["tg_token"], st.session_state["tg_chat_id"],
+                             "₿ <b>Fortune Pre-Market</b>\n\n" + _msg)
         render_telegram_panel(td, vd, _yield_data, _sector_data, tech_result)
 
     # ── Footer ────────────────────────────────────────────────────────────────
