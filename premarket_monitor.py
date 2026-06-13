@@ -1235,31 +1235,80 @@ def main():
             st.session_state.show_prompt = False
 
     if st.session_state.show_prompt and st.session_state.ai_prompt:
-        st.markdown('<div class="prompt-panel"><div class="prompt-title">📋 複製以下 Prompt，貼入 ChatGPT / Claude / Gemini</div></div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="prompt-panel">'
+            '<div class="prompt-title">📋 複製以下 Prompt，貼入 ChatGPT / Claude / Gemini</div>'
+            '</div>',
+            unsafe_allow_html=True)
+        # st.code() provides the native copy icon (top-right of code block) — most reliable in Streamlit Cloud
         st.code(st.session_state.ai_prompt, language="markdown")
-        # FIX #6: copy feedback via JS clipboard + toast
-        st.markdown("""
-        <script>
-        function copyPrompt() {
-            const blocks = window.parent.document.querySelectorAll('pre code');
-            if (blocks.length > 0) {
-                const text = blocks[blocks.length-1].innerText;
-                navigator.clipboard.writeText(text).then(() => {
-                    const btn = window.parent.document.getElementById('copy-prompt-btn');
-                    if (btn) { btn.innerText = '✅ 已複製！'; setTimeout(()=>{ btn.innerText='📋 複製 Prompt'; }, 3000); }
-                });
-            }
-        }
-        </script>
-        <button id="copy-prompt-btn" onclick="copyPrompt()"
-          style="font-family:monospace;font-size:.73rem;background:#6B7C6E;color:#FAF7F2;
-                 border:none;border-radius:4px;padding:.38rem 1rem;cursor:pointer;margin-top:.3rem">
-          📋 複製 Prompt
-        </button>
-        <span style="font-family:monospace;font-size:.65rem;color:#8A8278;margin-left:.5rem">
-          或點擊代碼框右上角複製圖示
-        </span>""", unsafe_allow_html=True)
+
+        # Secondary copy button using st.components.v1.html() — runs in its own iframe
+        # so it has proper clipboard permissions, unlike st.markdown <script> which is stripped
+        import streamlit.components.v1 as _stc
+        # Escape chars that would break the JS template literal
+        _pe = st.session_state.ai_prompt
+        _pe = _pe.replace("\\", "\\\\")  # backslash first
+        _pe = _pe.replace("`", "\\`")          # backtick
+        _pe = _pe.replace("${", "\\${")        # template literal interpolation
+        _prompt_escaped = _pe
+        _copy_html = f"""
+<style>
+  #copy-btn {{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .73rem;
+    background: #6B7C6E;
+    color: #FAF7F2;
+    border: none;
+    border-radius: 4px;
+    padding: .38rem 1.1rem;
+    cursor: pointer;
+    transition: background .2s;
+  }}
+  #copy-btn:hover {{ background: #5a6b5d; }}
+  #copy-btn.success {{ background: #3A7D5C; }}
+  #hint {{ font-family: monospace; font-size: .65rem; color: #8A8278; margin-left: .6rem; }}
+</style>
+<button id="copy-btn" onclick="doCopy()">📋 複製 Prompt</button>
+<span id="hint">或點擊代碼框右上角複製圖示</span>
+<script>
+function doCopy() {{
+  const text = `{_prompt_escaped}`;
+  // Method 1: modern clipboard API (works when page has focus)
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text)
+      .then(onSuccess)
+      .catch(() => fallback(text));
+  }} else {{
+    fallback(text);
+  }}
+}}
+function fallback(text) {{
+  // Method 2: execCommand — works inside iframes without clipboard permission
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  try {{
+    document.execCommand('copy');
+    onSuccess();
+  }} catch(e) {{
+    document.getElementById('hint').innerText = '⚠️ 請手動選取代碼框文字複製';
+  }}
+  document.body.removeChild(ta);
+}}
+function onSuccess() {{
+  const btn = document.getElementById('copy-btn');
+  btn.innerText = '✅ 已複製！';
+  btn.classList.add('success');
+  setTimeout(() => {{
+    btn.innerText = '📋 複製 Prompt';
+    btn.classList.remove('success');
+  }}, 3000);
+}}
+</script>"""
+        _stc.html(_copy_html, height=48)
 
     # ── Stock sections ────────────────────────────────────────────────────────
     all_sections = {"核心持倉": WATCHLISTS["核心持倉"], "指數ETF": WATCHLISTS["指數ETF"]}
