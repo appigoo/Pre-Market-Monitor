@@ -1617,68 +1617,108 @@ MACRO_LEAD_TICKERS = {
 def fetch_macro_leads() -> dict:
     """
     Fetch DXY, BTC, Gold, Silver with pre/post market awareness.
-    Returns normalised dict per ticker with spark (5-day intraday trend chars).
+    DXY: tries DX=F first, falls back to UUP (USD ETF) if futures fail.
+    Gold/Silver: always fetches daily bars for reliable H/L.
+    Returns normalised dict per ticker with spark (5-day trend chars).
     """
     et_t   = datetime.now(pytz.timezone("America/New_York")).time()
     is_pre = time(4, 0) <= et_t < time(9, 30)
     results = {}
 
+    # DXY fallback chain: DX=F → UUP (Invesco DB USD ETF, tracks DXY closely)
+    # UUP is an equity ETF so chart API works reliably on cloud
+    DXY_CHAIN = ["DX=F", "UUP"]
+
+    def _yf_daily(tk: str) -> dict | None:
+        """Fetch last 7 days of daily bars, return normalised dict."""
+        try:
+            df = yf.download(tk, period="7d", interval="1d",
+                             progress=False, auto_adjust=True)
+            if df.empty: return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            price = float(df["Close"].iloc[-1])
+            prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
+            high  = float(df["High"].iloc[-1])  if "High" in df.columns else None
+            low   = float(df["Low"].iloc[-1])   if "Low"  in df.columns else None
+            return dict(price=price, prev=prev,
+                        reg_chg=price - prev,
+                        reg_pct=(price - prev) / prev * 100 if prev else None,
+                        pre_price=None, pre_pct=None,
+                        high=high, low=low, error=None)
+        except Exception:
+            return None
+
     for ticker, meta in MACRO_LEAD_TICKERS.items():
         d = None
-        # Layer 1: chart API (best for real-time + pre-market)
-        try:
-            d = _yahoo_chart_api(ticker)
-        except Exception:
-            pass
+        actual_ticker = ticker   # track which ticker succeeded (for UUP fallback)
 
-        # Layer 2: yf.download daily fallback
-        if d is None or d.get("error") or not d.get("price"):
+        if ticker == "DX=F":
+            # Try each ticker in the fallback chain
+            for _tk in DXY_CHAIN:
+                # Layer 1: chart API
+                try:
+                    d = _yahoo_chart_api(_tk)
+                    if d and not d.get("error") and d.get("price"):
+                        actual_ticker = _tk
+                        break
+                except Exception:
+                    pass
+                # Layer 2: daily download
+                d = _yf_daily(_tk)
+                if d and d.get("price"):
+                    actual_ticker = _tk
+                    break
+                d = None
+        else:
+            # Layer 1: chart API
             try:
-                df = yf.download(ticker, period="7d", interval="1d",
-                                 progress=False, auto_adjust=True)
-                if not df.empty:
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    price = float(df["Close"].iloc[-1])
-                    prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
-                    d = dict(price=price, prev=prev,
-                             reg_chg=price - prev,
-                             reg_pct=(price - prev) / prev * 100 if prev else None,
-                             pre_price=None, pre_pct=None,
-                             high=float(df["High"].iloc[-1]) if "High" in df.columns else None,
-                             low =float(df["Low"].iloc[-1])  if "Low"  in df.columns else None,
-                             error=None)
+                d = _yahoo_chart_api(ticker)
             except Exception:
                 pass
+            # Layer 2: daily download (also provides reliable H/L for futures)
+            if d is None or d.get("error") or not d.get("price"):
+                d = _yf_daily(ticker)
+            # Layer 2b: if chart API succeeded but H/L missing, supplement from daily
+            elif d.get("high") is None or d.get("low") is None:
+                _daily = _yf_daily(ticker)
+                if _daily:
+                    if d.get("high") is None: d["high"] = _daily.get("high")
+                    if d.get("low")  is None: d["low"]  = _daily.get("low")
 
-        if d is None or d.get("error"):
+        if d is None or d.get("error") or not d.get("price"):
             results[ticker] = dict(meta=meta, error="載入失敗")
             continue
 
+        # UUP label override: show "DXY≈" prefix so user knows it's a proxy
+        display_meta = dict(meta)
+        if actual_ticker == "UUP":
+            display_meta["label"] = "DXY≈ (UUP)"
+            display_meta["note"]  = "UUP ETF代理 — DXY期貨暫不可用"
+
         # Pick best price + pct for current session
         if is_pre and d.get("pre_price") and d.get("pre_pct") is not None:
-            disp_price = d["pre_price"]
-            disp_pct   = d["pre_pct"]
+            disp_price  = d["pre_price"]
+            disp_pct    = d["pre_pct"]
             session_lbl = "盤前"
         elif d.get("price") and d.get("reg_pct") is not None:
-            disp_price = d["price"]
-            disp_pct   = d["reg_pct"]
-            session_lbl = "即時" if ticker in ("BTC-USD",) else "收盤"
+            disp_price  = d["price"]
+            disp_pct    = d["reg_pct"]
+            session_lbl = "即時" if ticker == "BTC-USD" else "收盤"
         else:
-            disp_price = d.get("price") or d.get("prev")
-            disp_pct   = None
+            disp_price  = d.get("price") or d.get("prev")
+            disp_pct    = None
             session_lbl = "—"
 
-        # 5-day spark: fetch daily closes for mini trend chars
+        # 5-day spark from daily closes (reuse _yf_daily data when available)
         spark = ""
         try:
-            df5 = yf.download(ticker, period="6d", interval="1d",
+            df5 = yf.download(actual_ticker, period="6d", interval="1d",
                               progress=False, auto_adjust=True)
             if not df5.empty:
                 if isinstance(df5.columns, pd.MultiIndex):
                     df5.columns = df5.columns.get_level_values(0)
                 closes = df5["Close"].dropna().tolist()[-5:]
-                # Build spark string: ▁▂▃▄▅▆▇█ based on relative position
                 if len(closes) >= 2:
                     lo, hi = min(closes), max(closes)
                     rng = hi - lo or 1
@@ -1688,7 +1728,7 @@ def fetch_macro_leads() -> dict:
             spark = ""
 
         results[ticker] = dict(
-            meta        = meta,
+            meta        = display_meta,
             price       = disp_price,
             pct         = disp_pct,
             prev        = d.get("prev"),
@@ -1696,6 +1736,7 @@ def fetch_macro_leads() -> dict:
             low         = d.get("low"),
             session_lbl = session_lbl,
             spark       = spark,
+            actual_tk   = actual_ticker,
             error       = None,
         )
     return results
