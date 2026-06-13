@@ -161,6 +161,34 @@ def inject_css():
     /* VIX DELTA */
     .vix-delta{{font-family:var(--mono);font-size:.65rem;margin-top:.08rem;}}
 
+    /* YIELD PANEL */
+    .yield-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;margin-bottom:.5rem;}}
+    .yield-card{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.7rem .9rem;text-align:center;}}
+    .yield-label{{font-family:var(--mono);font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;
+        color:var(--muted);margin-bottom:.22rem;}}
+    .yield-value{{font-family:var(--mono);font-size:1.18rem;font-weight:700;}}
+    .yield-chg{{font-family:var(--mono);font-size:.68rem;margin-top:.06rem;}}
+    .yield-signal{{font-family:var(--sans);font-size:.72rem;border-left:3px solid var(--border);
+        padding:.45rem .85rem;margin-top:.4rem;border-radius:0 4px 4px 0;}}
+
+    /* SECTOR ROTATION */
+    .sector-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem;margin-bottom:.4rem;}}
+    .sector-card{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.6rem .8rem;position:relative;overflow:hidden;}}
+    .sector-bar{{position:absolute;bottom:0;left:0;height:3px;border-radius:0 0 0 0;transition:width .4s;}}
+    .sector-name{{font-family:var(--mono);font-size:.6rem;font-weight:600;letter-spacing:.08em;
+        text-transform:uppercase;color:var(--muted);margin-bottom:.18rem;}}
+    .sector-etf{{font-family:var(--mono);font-size:.55rem;color:var(--muted);}}
+    .sector-pct{{font-family:var(--mono);font-size:1.05rem;font-weight:700;margin:.12rem 0;}}
+    .sector-rank{{position:absolute;top:.4rem;right:.55rem;font-family:var(--mono);
+        font-size:.58rem;color:var(--muted);}}
+    .sector-leader{{border-color:var(--up);box-shadow:0 0 0 1px var(--up-bg);}}
+    .sector-laggard{{border-color:var(--down);box-shadow:0 0 0 1px var(--down-bg);}}
+    .rotation-insight{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.65rem 1rem;font-family:var(--sans);font-size:.76rem;line-height:1.6;
+        color:var(--text);margin-top:.3rem;}}
+
     /* CALENDAR */
     .cal-wrap{{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:.9rem 1.1rem;margin-bottom:.6rem;}}
     .cal-title{{font-family:var(--mono);font-size:.68rem;font-weight:700;letter-spacing:.15em;
@@ -817,6 +845,268 @@ OIL_TICKERS = {
     "NG=F": {"label":"天然氣","unit":"美元/MMBtu"},
 }
 
+
+# ── US Treasury Yields ────────────────────────────────────────────────────────
+YIELD_TICKERS = {
+    "^IRX": {"label":"3M","full":"3月期","threshold":None},
+    "^FVX": {"label":"5Y","full":"5年","threshold":None},
+    "^TNX": {"label":"10Y","full":"10年","threshold":4.5},
+    "^TYX": {"label":"30Y","full":"30年","threshold":5.0},
+}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_yields() -> dict:
+    """Fetch US Treasury yield data. Yields are quoted as % (e.g. 4.25 = 4.25%)."""
+    results = {}
+    for ticker, meta in YIELD_TICKERS.items():
+        d = None
+        try: d = _yahoo_chart_api(ticker)
+        except Exception: pass
+        if d is None or d.get("error") or not d.get("price"):
+            try:
+                df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=True)
+                if not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                    price = float(df["Close"].iloc[-1])
+                    prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
+                    d = dict(price=price, prev=prev,
+                             reg_chg=price-prev, reg_pct=(price-prev)/prev*100 if prev else None,
+                             error=None)
+            except Exception: pass
+        if d and not d.get("error") and d.get("price"):
+            price = d["price"]
+            prev  = d.get("prev") or price
+            chg   = d.get("reg_chg") or (price - prev)
+            # Yields: change in basis points = chg * 100
+            bp    = round(chg * 100, 1)
+            results[ticker] = dict(
+                label    = meta["label"],
+                full     = meta["full"],
+                threshold= meta["threshold"],
+                value    = price,      # e.g. 4.25 (%)
+                prev     = prev,
+                chg      = chg,        # e.g. +0.05
+                bp       = bp,         # basis points change
+            )
+        else:
+            results[ticker] = dict(label=meta["label"], full=meta["full"],
+                                   threshold=meta["threshold"], error="—")
+    return results
+
+
+def _yield_signal(y10, y2_or_3m, y30) -> tuple[str, str, str]:
+    """
+    Interpret yield curve shape → (signal_text, bg_color, border_color)
+    Uses 10Y as primary; 3M as short-end proxy when 2Y unavailable.
+    """
+    if y10 is None: return "殖利率數據不足", "#F0EDE8", "#D8D0C0"
+    # Absolute level signals
+    if y10 >= 5.0:
+        return "⚠️ 10年息 ≥5.0% — 股市估值嚴重受壓，成長股高風險", "#FDECEA", "#C0392B"
+    if y10 >= 4.5:
+        return "🔶 10年息 ≥4.5% — 科技股/TSLA承壓，留意Fed路徑", "#FFF8E8", "#D4A017"
+    if y10 <= 3.5:
+        return "✅ 10年息 ≤3.5% — 估值壓力低，利好成長股", "#EAF4EE", "#3A7D5C"
+    # Inversion signal
+    if y2_or_3m is not None and y2_or_3m > y10 + 0.1:
+        return f"🔴 殖利率曲線倒掛 ({y2_or_3m:.2f}% > {y10:.2f}%) — 衰退預警訊號", "#FDECEA", "#C0392B"
+    return f"10年息 {y10:.2f}% — 中性水平，暫無極端壓力", "#F0EDE8", "#D8D0C0"
+
+
+def render_yield_panel():
+    st.markdown('<div class="section-label">▸ 🏦 美債殖利率監控</div>', unsafe_allow_html=True)
+    yields = fetch_yields()
+
+    # Grid of 4 yield cards
+    html = '<div class="yield-grid">'
+    for ticker, d in yields.items():
+        if d.get("error"):
+            html += (f'<div class="yield-card"><div class="yield-label">{d["label"]}</div>'
+                     f'<div class="yield-value flat">—</div></div>')
+            continue
+        val  = d["value"]
+        bp   = d["bp"]
+        chg_col = "up" if bp > 0 else ("down" if bp < 0 else "flat")
+        bp_str  = (f'+{bp:.1f}' if bp >= 0 else f'{bp:.1f}') + "bp"
+        # Threshold warning badge
+        badge = ""
+        thr = d.get("threshold")
+        if thr and val >= thr:
+            badge = f'<span class="signal-badge signal-bearish">≥{thr}%</span>'
+        elif thr and val >= thr - 0.2:
+            badge = f'<span class="signal-badge signal-neutral">接近{thr}%</span>'
+        html += (
+            f'<div class="yield-card">' +
+            f'<div class="yield-label">{d["label"]} {d["full"]}{badge}</div>' +
+            f'<div class="yield-value {chg_col}">{val:.3f}%</div>' +
+            f'<div class="yield-chg {chg_col}">{bp_str} vs昨</div>' +
+            f'</div>'
+        )
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+    # Yield curve signal bar
+    y10  = yields.get("^TNX",{}).get("value")
+    y3m  = yields.get("^IRX",{}).get("value")
+    y30  = yields.get("^TYX",{}).get("value")
+    msg, bg, bc = _yield_signal(y10, y3m, y30)
+
+    # Spread display
+    spread_html = ""
+    if y10 and y3m:
+        spread = y10 - y3m
+        s_col  = "var(--up)" if spread > 0 else "var(--down)"
+        spread_html = (
+            f'<span style="font-family:var(--mono,monospace);font-size:.68rem;'
+            f'color:{s_col};margin-left:1rem">'
+            f'10Y-3M 利差: {"+":s}{spread:+.2f}%</span>'
+        ).replace("{"+":s}","")
+        spread_html = (
+            f'<span style="font-family:var(--mono,monospace);font-size:.68rem;'
+            f'color:{s_col};margin-left:1rem">'
+            f'10Y-3M 利差: {spread:+.2f}%</span>'
+        )
+    st.markdown(
+        f'<div class="yield-signal" style="background:{bg};border-left-color:{bc};border-left-width:3px">'
+        f'{msg}{spread_html}</div>',
+        unsafe_allow_html=True)
+
+
+# ── Sector Rotation ───────────────────────────────────────────────────────────
+SECTORS = [
+    ("XLK",  "科技",   "Technology"),
+    ("XLF",  "金融",   "Financials"),
+    ("XLE",  "能源",   "Energy"),
+    ("XLV",  "醫療",   "Healthcare"),
+    ("XLI",  "工業",   "Industrials"),
+    ("XLC",  "通訊",   "Comm Svcs"),
+    ("XLY",  "非必需", "Cons Discr"),
+    ("XLU",  "公用",   "Utilities"),
+]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_sectors() -> list:
+    """Fetch all sector ETFs and return sorted by today's performance."""
+    results = []
+    for ticker, name_zh, name_en in SECTORS:
+        d = None
+        try: d = _yahoo_chart_api(ticker)
+        except Exception: pass
+        if d is None or d.get("error") or not d.get("price"):
+            try:
+                df = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=True)
+                if not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                    price = float(df["Close"].iloc[-1])
+                    prev  = float(df["Close"].iloc[-2]) if len(df) >= 2 else price
+                    d = dict(price=price, prev=prev,
+                             pre_price=None, pre_pct=None, reg_pct=(price-prev)/prev*100 if prev else 0,
+                             error=None)
+            except Exception: pass
+        if d and not d.get("error"):
+            # Choose best available pct
+            et_t = datetime.now(pytz.timezone("America/New_York")).time()
+            _is_reg = time(9,30) <= et_t < time(16,0)
+            if d.get("pre_pct") is not None and not _is_reg:
+                pct = d["pre_pct"]
+            elif d.get("reg_pct") is not None:
+                pct = d["reg_pct"]
+            else:
+                pct = 0.0
+            results.append(dict(
+                ticker   = ticker,
+                name_zh  = name_zh,
+                name_en  = name_en,
+                price    = d.get("price") or d.get("pre_price"),
+                pct      = pct or 0.0,
+                error    = None,
+            ))
+        else:
+            results.append(dict(ticker=ticker, name_zh=name_zh, name_en=name_en,
+                                price=None, pct=None, error=True))
+    # Sort descending by pct (leader → laggard)
+    results.sort(key=lambda x: x["pct"] if x["pct"] is not None else -999, reverse=True)
+    return results
+
+
+def _rotation_insight(sectors: list) -> str:
+    """Generate a one-line rotation insight from sector rankings."""
+    valid = [s for s in sectors if not s.get("error") and s["pct"] is not None]
+    if len(valid) < 3: return ""
+    leader  = valid[0]
+    laggard = valid[-1]
+    tech    = next((s for s in valid if s["ticker"] == "XLK"), None)
+    energy  = next((s for s in valid if s["ticker"] == "XLE"), None)
+    util    = next((s for s in valid if s["ticker"] == "XLU"), None)
+
+    parts = []
+    # Risk-on / Risk-off判斷
+    if leader["ticker"] in ("XLK","XLY","XLC"):
+        parts.append("📈 <b>Risk-On</b>：科技/消費領漲，市場情緒偏進取")
+    elif leader["ticker"] in ("XLU","XLV"):
+        parts.append("🛡️ <b>Risk-Off</b>：防禦板塊領漲，資金避險情緒上升")
+    elif leader["ticker"] == "XLE":
+        parts.append("🛢️ <b>能源主導</b>：油價驅動，留意通脹預期上升")
+    elif leader["ticker"] == "XLF":
+        parts.append("🏦 <b>金融領漲</b>：利率預期上升或曲線走陡")
+
+    # TSLA-specific
+    if tech:
+        if tech["pct"] > 0.5:
+            parts.append(f"XLK 科技 {fmt_pct(tech['pct'])} 利好 TSLA")
+        elif tech["pct"] < -0.5:
+            parts.append(f"XLK 科技 {fmt_pct(tech['pct'])} 壓制 TSLA")
+
+    # Laggard warning
+    if laggard["pct"] is not None and laggard["pct"] < -1.5:
+        parts.append(f"⚠️ {laggard['name_zh']}({laggard['ticker']}) 大幅落後 {fmt_pct(laggard['pct'])}")
+
+    return " &nbsp;·&nbsp; ".join(parts) if parts else f"領漲：{leader['name_zh']} · 落後：{laggard['name_zh']}"
+
+
+def render_sector_panel():
+    st.markdown('<div class="section-label">▸ 🔄 板塊輪動監控</div>', unsafe_allow_html=True)
+    with st.spinner("載入板塊數據..."):
+        sectors = fetch_sectors()
+
+    valid = [s for s in sectors if not s.get("error") and s["pct"] is not None]
+    max_abs = max((abs(s["pct"]) for s in valid), default=1) or 1
+
+    html = '<div class="sector-grid">'
+    for i, s in enumerate(sectors):
+        if s.get("error") or s["pct"] is None:
+            html += (f'<div class="sector-card"><div class="sector-name">{s["name_zh"]}</div>'
+                     f'<div class="sector-etf">{s["ticker"]}</div>'
+                     f'<div class="sector-pct flat">—</div></div>')
+            continue
+        pct  = s["pct"]
+        col  = "var(--up)" if pct > 0 else "var(--down)"
+        col_cls = "up" if pct > 0 else ("down" if pct < 0 else "flat")
+        bar_w = min(abs(pct) / max_abs * 100, 100)
+        # leader/laggard border
+        extra_cls = ""
+        if i == 0: extra_cls = " sector-leader"
+        elif i == len(sectors)-1: extra_cls = " sector-laggard"
+        rank_sym = "▲" if i == 0 else ("▼" if i == len(sectors)-1 else f"#{i+1}")
+        html += (
+            f'<div class="sector-card{extra_cls}">' +
+            f'<div class="sector-rank">{rank_sym}</div>' +
+            f'<div class="sector-name">{s["name_zh"]}</div>' +
+            f'<div class="sector-etf">{s["ticker"]}</div>' +
+            f'<div class="sector-pct {col_cls}">{fmt_pct(pct)}</div>' +
+            f'<div class="sector-bar" style="width:{bar_w:.0f}%;background:{col}"></div>' +
+            f'</div>'
+        )
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+    # Rotation insight
+    insight = _rotation_insight(sectors)
+    if insight:
+        st.markdown(
+            f'<div class="rotation-insight">{insight}</div>',
+            unsafe_allow_html=True)
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_oil_data() -> dict:
     results = {}
@@ -1076,6 +1366,31 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
     vix_val   = fmt_num(vix_data.get("price")) if vix_data and not vix_data.get("error") else "N/A"
     fetch_time = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M:%S ET")
 
+    # Add yield + sector data to prompt
+    yield_lines = ""
+    try:
+        yd = fetch_yields()
+        y_parts = []
+        for tk, yd_item in yd.items():
+            if not yd_item.get("error") and yd_item.get("value"):
+                bp = yd_item.get("bp",0)
+                bp_s = f"+{bp:.1f}" if bp >= 0 else f"{bp:.1f}"
+                y_parts.append(f'{yd_item["label"]} {yd_item["value"]:.3f}% ({bp_s}bp)')
+        yield_lines = " | ".join(y_parts)
+    except Exception:
+        yield_lines = "N/A"
+
+    sector_lines = ""
+    try:
+        secs = fetch_sectors()
+        valid_s = [s for s in secs if not s.get("error") and s["pct"] is not None]
+        if valid_s:
+            top3    = " > ".join([f'{s["name_zh"]}({fmt_pct(s["pct"])})' for s in valid_s[:3]])
+            bottom2 = " | ".join([f'{s["name_zh"]}({fmt_pct(s["pct"])})' for s in valid_s[-2:]])
+            sector_lines = f"領漲：{top3} | 落後：{bottom2}"
+    except Exception:
+        sector_lines = "N/A"
+
     return f"""# 美股即時分析請求
 日期：{today_str}  時間：{fetch_time}  時段：{session}  數據抓取：{fetch_time}
 
@@ -1093,6 +1408,8 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
 | VIX  | {vix_val} |
 | WTI 原油 | {wti_str} |
 | Brent 原油 | {brent_str} |
+| 美債殖利率 | {yield_lines} |
+| 板塊輪動 | {sector_lines} |
 
 ## 請幫我分析：
 1. **今日最大風險/機會**是什麼？對 TSLA 和納指方向的影響？
@@ -1168,8 +1485,13 @@ def main():
         show_lev     = st.checkbox("槓桿ETF",       value=False)
         show_oil     = st.checkbox("能源價格",       value=True)
         show_fg      = st.checkbox("恐懼貪婪指數",  value=True)
+        show_yield   = st.checkbox("美債殖利率",     value=True)
+        show_sector  = st.checkbox("板塊輪動",       value=True)
         show_trump   = st.checkbox("Trump 消息",    value=True)
         show_iran    = st.checkbox("伊朗/油價新聞", value=True)
+        show_fed     = st.checkbox("Fed 官員表態",  value=True)
+        show_earnings= st.checkbox("科技財報動態",  value=True)
+        show_china   = st.checkbox("中美貿易/台灣", value=True)
 
         st.markdown("---")
         if st.button("🔄 立即刷新全部"):
@@ -1328,7 +1650,15 @@ function onSuccess() {{
     if show_oil:
         render_oil_panel()
 
-    # ── FIX #9: Fear & Greed ─────────────────────────────────────────────────
+    # ── Yields ───────────────────────────────────────────────────────────────
+    if show_yield:
+        render_yield_panel()
+
+    # ── Sector rotation ───────────────────────────────────────────────────────
+    if show_sector:
+        render_sector_panel()
+
+    # ── Fear & Greed ──────────────────────────────────────────────────────────
     if show_fg:
         st.markdown('<div class="section-label">▸ 😱 市場情緒指標</div>', unsafe_allow_html=True)
         render_fear_greed()
@@ -1340,6 +1670,21 @@ function onSuccess() {{
         render_intel_panel("Trump 最新表態監控", f"Trump Truth Social statement stock market {_today}", sk, gk, "🇺🇸")
     if show_iran:
         render_intel_panel("伊朗戰爭 · 油價消息", f"Iran war oil price Hormuz ceasefire {_today}", sk, gk, "🛢️")
+    if show_fed:
+        render_intel_panel(
+            "Fed 官員表態監控",
+            f"Federal Reserve official speech hawkish dovish rate Warsh Powell {_today}",
+            sk, gk, "🏦")
+    if show_earnings:
+        render_intel_panel(
+            "科技財報 · 業績動態",
+            f"tech earnings results NVDA TSLA MSFT AAPL AMZN guidance {_today}",
+            sk, gk, "📊")
+    if show_china:
+        render_intel_panel(
+            "中美貿易 · 台灣局勢",
+            f"US China trade tariff Taiwan semiconductor TSLA Shanghai {_today}",
+            sk, gk, "🌏")
 
     # ── Quick metrics bar ─────────────────────────────────────────────────────
     st.markdown('<div class="section-label">▸ 快速指標</div>', unsafe_allow_html=True)
