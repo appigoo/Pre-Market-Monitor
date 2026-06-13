@@ -1,8 +1,10 @@
 """
 盤前監控 Pre-Market Monitor
 美股盤前數據監控 | Fortune Trading Desk
-v4: 全面升級 — st_autorefresh · 價位警報 · VIX歷史對比 · 深色模式
+v5: 全面升級 — st_autorefresh · 價位警報 · VIX歷史對比 · 深色模式
      · 恐懼貪婪指數 · 新聞手動刷新 · 週曆排序 · Prompt複製反饋
+     · 殖利率 · 板塊輪動 · Fed/財報/中美intel · TSLA技術位
+     · Telegram推送 · 相對強弱 · Put/Call Ratio
 """
 
 import streamlit as st
@@ -256,6 +258,55 @@ def inject_css():
     .gap-down{{background:var(--down-bg);color:var(--down);}}
     .signal-row{{background:var(--bg2);border-radius:5px;padding:.55rem .8rem;
         font-family:var(--sans);font-size:.76rem;line-height:1.65;margin-top:.5rem;}}
+
+    /* RELATIVE STRENGTH */
+    .rs-wrap{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.9rem 1.1rem;margin-bottom:.5rem;}}
+    .rs-header{{display:flex;justify-content:space-between;align-items:center;
+        margin-bottom:.7rem;padding-bottom:.38rem;border-bottom:1px solid var(--border);}}
+    .rs-title{{font-family:var(--mono);font-size:.72rem;font-weight:600;
+        letter-spacing:.08em;color:var(--accent);text-transform:uppercase;}}
+    .rs-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;margin-bottom:.55rem;}}
+    .rs-card{{background:var(--bg);border:1px solid var(--border);border-radius:5px;
+        padding:.6rem .75rem;text-align:center;}}
+    .rs-card.outperform{{border-color:var(--up);background:var(--up-bg);}}
+    .rs-card.underperform{{border-color:var(--down);background:var(--down-bg);}}
+    .rs-label{{font-family:var(--mono);font-size:.56rem;letter-spacing:.1em;
+        text-transform:uppercase;color:var(--muted);margin-bottom:.14rem;}}
+    .rs-val{{font-family:var(--mono);font-size:1.05rem;font-weight:700;}}
+    .rs-sub{{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.06rem;}}
+    .rs-bar-wrap{{background:var(--border);border-radius:4px;height:6px;
+        margin:.45rem 0 .3rem;position:relative;overflow:visible;}}
+    .rs-bar-zero{{position:absolute;left:50%;top:-3px;width:2px;height:12px;
+        background:var(--muted);border-radius:1px;}}
+    .rs-bar-fill{{position:absolute;top:0;height:6px;border-radius:4px;transition:width .4s;}}
+    .rs-verdict{{font-family:var(--sans);font-size:.76rem;line-height:1.65;
+        padding:.5rem .8rem;border-radius:5px;background:var(--bg2);}}
+
+    /* PUT/CALL RATIO */
+    .pc-wrap{{background:var(--card);border:1px solid var(--border);border-radius:6px;
+        padding:.9rem 1.1rem;margin-bottom:.5rem;}}
+    .pc-header{{display:flex;justify-content:space-between;align-items:center;
+        margin-bottom:.65rem;padding-bottom:.38rem;border-bottom:1px solid var(--border);}}
+    .pc-title{{font-family:var(--mono);font-size:.72rem;font-weight:600;
+        letter-spacing:.08em;color:var(--accent);text-transform:uppercase;}}
+    .pc-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin-bottom:.5rem;}}
+    .pc-card{{background:var(--bg);border:1px solid var(--border);border-radius:5px;
+        padding:.65rem .85rem;text-align:center;}}
+    .pc-card.extreme-fear{{border-color:var(--up);background:var(--up-bg);}}
+    .pc-card.extreme-greed{{border-color:var(--down);background:var(--down-bg);}}
+    .pc-card.neutral{{border-color:var(--accent);}}
+    .pc-label{{font-family:var(--mono);font-size:.56rem;letter-spacing:.1em;
+        text-transform:uppercase;color:var(--muted);margin-bottom:.14rem;}}
+    .pc-val{{font-family:var(--mono);font-size:1.28rem;font-weight:700;}}
+    .pc-sub{{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.06rem;}}
+    .pc-meter{{width:100%;height:8px;border-radius:4px;
+        background:linear-gradient(90deg,var(--up) 0%,var(--flat-bg) 40%,var(--flat-bg) 60%,var(--down) 100%);
+        margin:.38rem 0;position:relative;}}
+    .pc-needle{{position:absolute;top:-4px;width:4px;height:16px;
+        background:var(--text);border-radius:2px;transform:translateX(-50%);transition:left .5s;}}
+    .pc-signal{{font-family:var(--sans);font-size:.76rem;padding:.5rem .8rem;
+        border-radius:5px;line-height:1.65;}}
 
     /* TELEGRAM PANEL */
     .tg-panel{{background:var(--card);border:1px solid var(--border);border-radius:6px;
@@ -1520,6 +1571,381 @@ def render_tsla_tech_panel():
     return t  # return for Telegram use
 
 
+
+# ── #3 TSLA vs QQQ Relative Strength ─────────────────────────────────────────
+RS_PAIRS = [
+    # (ticker, label_zh, benchmark)
+    ("TSLA", "TSLA", "QQQ"),
+    ("NVDA", "NVDA", "QQQ"),
+    ("AAPL", "AAPL", "QQQ"),
+    ("MSFT", "MSFT", "QQQ"),
+]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_relative_strength() -> dict:
+    """
+    Fetch session pct for TSLA, NVDA, AAPL, MSFT vs QQQ benchmark.
+    Returns dict keyed by ticker with pct, qqq_pct, rs (difference), 5d/20d avg RS.
+    """
+    et_t   = datetime.now(pytz.timezone("America/New_York")).time()
+    is_pre = time(4,0) <= et_t < time(9,30)
+    is_reg = time(9,30) <= et_t < time(16,0)
+
+    def _pct(d: dict) -> float | None:
+        if not d or d.get("error"): return None
+        if is_pre and d.get("pre_pct") is not None:  return d["pre_pct"]
+        if d.get("reg_pct") is not None:              return d["reg_pct"]
+        if d.get("pre_pct") is not None:              return d["pre_pct"]
+        return None
+
+    # Fetch quotes
+    qqq_d   = fetch_quote("QQQ")
+    qqq_pct = _pct(qqq_d)
+
+    results = {}
+    tickers = list({t for t,_,_ in RS_PAIRS} | {"QQQ"})
+    quote_map = {"QQQ": qqq_d}
+    for t,_,_ in RS_PAIRS:
+        if t not in quote_map:
+            quote_map[t] = fetch_quote(t)
+
+    # 20-day historical RS for context (uses daily close)
+    hist_rs = {}
+    try:
+        all_t = [t for t,_,_ in RS_PAIRS] + ["QQQ"]
+        df_hist = yf.download(all_t, period="30d", interval="1d",
+                              progress=False, auto_adjust=True)
+        if isinstance(df_hist.columns, pd.MultiIndex):
+            close = df_hist["Close"].dropna(how="all")
+        else:
+            close = df_hist[["Close"]].rename(columns={"Close": all_t[0]})
+        # pct returns
+        ret = close.pct_change() * 100
+        qqq_ret = ret.get("QQQ", pd.Series(dtype=float))
+        for t,_,_ in RS_PAIRS:
+            if t in ret.columns and len(qqq_ret) > 0:
+                rs_series = ret[t] - qqq_ret
+                hist_rs[t] = {
+                    "rs_5d":  float(rs_series.tail(5).mean()),
+                    "rs_20d": float(rs_series.tail(20).mean()),
+                }
+    except Exception:
+        pass
+
+    for ticker, label, bench in RS_PAIRS:
+        d    = quote_map.get(ticker, {})
+        pct  = _pct(d)
+        rs   = (pct - qqq_pct) if (pct is not None and qqq_pct is not None) else None
+        h    = hist_rs.get(ticker, {})
+        results[ticker] = dict(
+            label   = label,
+            pct     = pct,
+            qqq_pct = qqq_pct,
+            rs      = rs,          # today's RS vs QQQ
+            rs_5d   = h.get("rs_5d"),
+            rs_20d  = h.get("rs_20d"),
+            price   = d.get("pre_price") if is_pre else d.get("price"),
+        )
+    results["_qqq_pct"] = qqq_pct
+    return results
+
+
+def _rs_verdict(tsla_rs: float | None, rs_5d: float | None) -> tuple[str, str, str]:
+    """Return (verdict_text, bg_color, border_color)."""
+    if tsla_rs is None:
+        return "數據不足", "var(--flat-bg)", "var(--border)"
+    if tsla_rs >= 2.0:
+        return (f"🚀 <b>TSLA 強勢跑贏</b> QQQ {tsla_rs:+.2f}% — 公司/Musk催化驅動，可考慮重倉",
+                "var(--up-bg)", "var(--up)")
+    if tsla_rs >= 0.5:
+        return (f"✅ <b>TSLA 小幅跑贏</b> QQQ {tsla_rs:+.2f}% — 溫和強勢，跟隨大市做多",
+                "var(--up-bg)", "var(--up)")
+    if tsla_rs >= -0.5:
+        return (f"◆ <b>TSLA 跟隨大市</b>（RS {tsla_rs:+.2f}%）— 大市倉，跟 VIX/QQQ 方向走",
+                "var(--flat-bg)", "var(--muted)")
+    if tsla_rs >= -2.0:
+        return (f"⚠️ <b>TSLA 相對弱勢</b> {tsla_rs:+.2f}% vs QQQ — 避免做多，等強勢確認",
+                "var(--down-bg)", "var(--down)")
+    return (f"🔴 <b>TSLA 嚴重跑輸</b> QQQ {tsla_rs:+.2f}% — 公司負面催化，做空或觀望",
+            "var(--down-bg)", "var(--down)")
+
+
+def render_relative_strength():
+    st.markdown('<div class="section-label">▸ ⚖️ TSLA 相對強弱 vs QQQ</div>',
+                unsafe_allow_html=True)
+    with st.spinner("計算相對強弱..."):
+        rs_data = fetch_relative_strength()
+
+    qqq_pct = rs_data.get("_qqq_pct")
+    now_lbl = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+
+    html = (
+        '<div class="rs-wrap">'
+        '<div class="rs-header">'
+        '<div class="rs-title">⚖️ 相對強弱 vs QQQ</div>'
+        f'<div style="font-family:var(--mono,monospace);font-size:.6rem;color:var(--muted)">'
+        f'QQQ {fmt_pct(qqq_pct)} &nbsp;·&nbsp; {now_lbl}</div>'
+        '</div>'
+        '<div class="rs-grid">'
+    )
+
+    tsla_rs = None
+    for ticker, label, _ in RS_PAIRS:
+        d   = rs_data.get(ticker, {})
+        pct = d.get("pct")
+        rs  = d.get("rs")
+        r5  = d.get("rs_5d")
+        r20 = d.get("rs_20d")
+
+        if ticker == "TSLA": tsla_rs = rs
+
+        # Card class
+        if rs is None:          card_cls = ""
+        elif rs >= 0.5:         card_cls = "outperform"
+        elif rs <= -0.5:        card_cls = "underperform"
+        else:                   card_cls = ""
+
+        # Bar: center=50%, each 1% = 5px, capped ±10%
+        bar_pct   = min(max((rs or 0), -10), 10)   # clamp -10 to +10
+        bar_left  = 50.0
+        bar_width = abs(bar_pct) * 2.5              # 2.5% width per 1% RS
+        bar_color = "var(--up)" if (rs or 0) >= 0 else "var(--down)"
+        if (rs or 0) >= 0:
+            bar_style = f"left:{bar_left}%;width:{bar_width}%;background:{bar_color};"
+        else:
+            bar_style = f"left:{bar_left - bar_width}%;width:{bar_width}%;background:{bar_color};"
+
+        r5_str  = (f"{r5:+.2f}%" if r5  is not None else "—")
+        r20_str = (f"{r20:+.2f}%" if r20 is not None else "—")
+
+        html += (
+            f'<div class="rs-card {card_cls}">'
+            f'<div class="rs-label">{label}</div>'
+            f'<div class="rs-val {cc(pct)}">{fmt_pct(pct)}</div>'
+            f'<div class="rs-sub">vs QQQ <b class="{cc(rs)}">{fmt_pct(rs)}</b></div>'
+            f'<div class="rs-bar-wrap">'
+            f'<div class="rs-bar-zero"></div>'
+            f'<div class="rs-bar-fill" style="{bar_style}"></div>'
+            f'</div>'
+            f'<div class="rs-sub">5D均 {r5_str} &nbsp; 20D均 {r20_str}</div>'
+            f'</div>'
+        )
+    html += '</div>'
+
+    # Verdict
+    tsla_d   = rs_data.get("TSLA", {})
+    verdict, bg, bc = _rs_verdict(tsla_rs, tsla_d.get("rs_5d"))
+
+    # Trend context from 5d/20d
+    r5  = tsla_d.get("rs_5d")
+    r20 = tsla_d.get("rs_20d")
+    trend_txt = ""
+    if r5 is not None and r20 is not None:
+        if r5 > r20 + 0.3:
+            trend_txt = f" &nbsp;·&nbsp; 近5日均RS {r5:+.2f}% 強於20日 {r20:+.2f}%，動能改善"
+        elif r5 < r20 - 0.3:
+            trend_txt = f" &nbsp;·&nbsp; 近5日均RS {r5:+.2f}% 弱於20日 {r20:+.2f}%，動能惡化"
+        else:
+            trend_txt = f" &nbsp;·&nbsp; RS趨勢穩定（5D {r5:+.2f}% / 20D {r20:+.2f}%）"
+
+    html += (
+        f'<div class="rs-verdict" style="background:{bg};border-left:3px solid {bc}">'
+        f'{verdict}{trend_txt}'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ── #4 Put/Call Ratio ─────────────────────────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_put_call_ratio(tickers: list[str] | None = None) -> dict:
+    """
+    Fetch Put/Call ratio from Yahoo Finance options chain.
+    tickers: list of symbols to check. Default: TSLA + SPY.
+    Returns dict keyed by ticker: {put_vol, call_vol, pc_ratio, error}
+    """
+    if tickers is None:
+        tickers = ["TSLA", "SPY"]
+    results = {}
+    for ticker in tickers:
+        try:
+            t    = yf.Ticker(ticker)
+            exp  = t.options          # list of expiry dates
+            if not exp:
+                results[ticker] = dict(error="no options")
+                continue
+            # Use nearest expiry (index 0) for most liquid/timely signal
+            chain = t.option_chain(exp[0])
+            puts  = chain.puts
+            calls = chain.calls
+
+            put_vol  = int(puts["volume"].fillna(0).sum())
+            call_vol = int(calls["volume"].fillna(0).sum())
+            put_oi   = int(puts["openInterest"].fillna(0).sum())
+            call_oi  = int(calls["openInterest"].fillna(0).sum())
+
+            pc_vol = put_vol  / call_vol  if call_vol  > 0 else None
+            pc_oi  = put_oi   / call_oi   if call_oi   > 0 else None
+
+            # Also aggregate across all expiries for OI (more stable)
+            total_put_oi = 0; total_call_oi = 0
+            for e in exp[:4]:   # nearest 4 expiries
+                try:
+                    ch = t.option_chain(e)
+                    total_put_oi  += int(ch.puts["openInterest"].fillna(0).sum())
+                    total_call_oi += int(ch.calls["openInterest"].fillna(0).sum())
+                except Exception:
+                    break
+            pc_oi_all = total_put_oi / total_call_oi if total_call_oi > 0 else None
+
+            results[ticker] = dict(
+                put_vol   = put_vol,
+                call_vol  = call_vol,
+                put_oi    = put_oi,
+                call_oi   = call_oi,
+                pc_ratio  = pc_vol,      # volume-based (more timely)
+                pc_oi     = pc_oi,       # OI-based nearest expiry
+                pc_oi_all = pc_oi_all,   # OI-based all near expiries
+                expiry    = exp[0],
+                error     = None,
+            )
+        except Exception as e:
+            results[ticker] = dict(error=str(e)[:60])
+    return results
+
+
+def _pc_signal(ratio: float | None, ticker: str) -> tuple[str, str, str, str]:
+    """
+    Interpret P/C ratio.
+    Returns (signal_text, card_class, bg_color, border_color).
+    P/C > 1.2  = extreme fear  → contrarian BULLISH (markets often reverse)
+    P/C > 0.9  = fearful
+    P/C 0.6-0.9 = neutral
+    P/C < 0.6  = complacent/greedy → contrarian BEARISH
+    P/C < 0.4  = extreme greed → strong contrarian BEARISH
+    Note: TSLA has naturally higher P/C than SPY due to hedging demand.
+    """
+    if ratio is None:
+        return "數據不足", "", "var(--flat-bg)", "var(--border)"
+    t_label = ticker
+
+    if ratio >= 1.5:
+        return (f"🔴 {t_label} 極度恐慌 P/C={ratio:.2f} — 反向指標：做多訊號（峰值恐慌）",
+                "extreme-fear", "var(--up-bg)", "var(--up)")
+    if ratio >= 1.0:
+        return (f"⚠️ {t_label} 市場恐慌 P/C={ratio:.2f} — 偏向看跌，逆勢做多需謹慎",
+                "neutral", "var(--flat-bg)", "var(--accent)")
+    if ratio >= 0.7:
+        return (f"◆ {t_label} 中性 P/C={ratio:.2f} — 無極端情緒，方向跟隨技術面",
+                "neutral", "var(--flat-bg)", "var(--border)")
+    if ratio >= 0.5:
+        return (f"🟡 {t_label} 偏樂觀 P/C={ratio:.2f} — Call主導，留意過度自滿風險",
+                "extreme-greed", "var(--down-bg)", "var(--down)")
+    return (f"🔴 {t_label} 極度貪婪 P/C={ratio:.2f} — 反向指標：謹慎做多，考慮對沖",
+            "extreme-greed", "var(--down-bg)", "var(--down)")
+
+
+def render_put_call_panel():
+    st.markdown('<div class="section-label">▸ 📊 期權 Put/Call Ratio · 情緒極值偵測</div>',
+                unsafe_allow_html=True)
+    with st.spinner("抓取期權數據..."):
+        pc_data = fetch_put_call_ratio(["TSLA", "SPY", "QQQ"])
+
+    now_lbl = datetime.now(pytz.timezone("America/New_York")).strftime("%H:%M ET")
+
+    html = (
+        '<div class="pc-wrap">'
+        '<div class="pc-header">'
+        '<div class="pc-title">📊 Put/Call Ratio</div>'
+        f'<div style="font-family:var(--mono,monospace);font-size:.6rem;color:var(--muted)">'
+        f'Yahoo Finance 期權鏈 &nbsp;·&nbsp; {now_lbl}</div>'
+        '</div>'
+        '<div class="pc-grid">'
+    )
+
+    signal_rows = []
+    for ticker in ["TSLA", "SPY", "QQQ"]:
+        d = pc_data.get(ticker, {})
+        if d.get("error"):
+            html += (
+                f'<div class="pc-card">'
+                f'<div class="pc-label">{ticker}</div>'
+                f'<div class="pc-val flat">—</div>'
+                f'<div class="pc-sub">{d["error"][:30]}</div>'
+                f'</div>'
+            )
+            continue
+
+        ratio   = d.get("pc_ratio")      # volume P/C
+        oi_rat  = d.get("pc_oi_all")     # OI P/C (all near expiries)
+        expiry  = d.get("expiry","")
+        put_vol = d.get("put_vol",0)
+        call_vol= d.get("call_vol",0)
+
+        sig_txt, card_cls, bg, bc = _pc_signal(ratio, ticker)
+        signal_rows.append((sig_txt, bg, bc))
+
+        # Meter: 0.4=left edge, 1.6=right edge, neutral zone 0.6-0.9
+        # map ratio to 0-100%: (ratio-0.3)/(1.7-0.3)*100
+        meter_pct = max(0, min(100, (((ratio or 0.7) - 0.3) / 1.4) * 100))
+
+        ratio_col = "down" if (ratio or 0) < 0.6 else ("up" if (ratio or 0) > 1.0 else "flat")
+
+        html += (
+            f'<div class="pc-card {card_cls}">'
+            f'<div class="pc-label">{ticker} · Vol P/C</div>'
+            f'<div class="pc-val {ratio_col}">{f"{ratio:.2f}" if ratio else "—"}</div>'
+            f'<div class="pc-meter"><div class="pc-needle" style="left:{meter_pct:.0f}%"></div></div>'
+            f'<div class="pc-sub">'
+            f'Put {fmt_vol(put_vol)} / Call {fmt_vol(call_vol)}'
+            f'</div>'
+            f'<div class="pc-sub" style="margin-top:.1rem">'
+            f'OI比率 <b>{f"{oi_rat:.2f}" if oi_rat else "—"}</b> &nbsp;到期 {expiry}'
+            f'</div>'
+            f'</div>'
+        )
+    html += '</div>'
+
+    # Signal rows — TSLA first, most important
+    for sig_txt, bg, bc in signal_rows[:1]:   # only TSLA verdict prominent
+        html += (
+            f'<div class="pc-signal" style="background:{bg};border-left:3px solid {bc}">'
+            f'{sig_txt}'
+            f'</div>'
+        )
+
+    # Combined reading
+    tsla_r = pc_data.get("TSLA",{}).get("pc_ratio")
+    spy_r  = pc_data.get("SPY",{}).get("pc_ratio")
+    if tsla_r is not None and spy_r is not None:
+        combo_bg = "var(--flat-bg)"; combo_bc = "var(--border)"
+        if tsla_r > 1.2 and spy_r > 0.9:
+            combo = "📍 TSLA + SPY 雙雙恐慌 — 市場底部訊號，做多勝率提高"
+            combo_bg = "var(--up-bg)"; combo_bc = "var(--up)"
+        elif tsla_r < 0.6 and spy_r < 0.6:
+            combo = "📍 TSLA + SPY 雙雙貪婪 — 系統性過度樂觀，對沖風險"
+            combo_bg = "var(--down-bg)"; combo_bc = "var(--down)"
+        elif tsla_r > 1.2 and spy_r < 0.7:
+            combo = "📍 TSLA 個股恐慌 / 大市平靜 — TSLA特定風險，避免重倉"
+            combo_bg = "var(--flat-bg)"; combo_bc = "var(--accent)"
+        elif tsla_r < 0.6 and spy_r > 1.0:
+            combo = "📍 TSLA Call主導 / 大市謹慎 — TSLA超樂觀，謹防回調"
+            combo_bg = "var(--down-bg)"; combo_bc = "var(--down)"
+        else:
+            combo = f"SPY P/C {spy_r:.2f} · TSLA P/C {tsla_r:.2f} — 無極端分歧"
+
+        html += (
+            f'<div class="pc-signal" style="background:{combo_bg};border-left:3px solid {combo_bc};margin-top:.4rem">'
+            f'{combo}'
+            f'</div>'
+        )
+
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+
 # ── Telegram Push System ───────────────────────────────────────────────────────
 def _tg_send(token: str, chat_id: str, text: str) -> bool:
     """Send a Telegram message. Returns True on success."""
@@ -1865,6 +2291,38 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
     except Exception:
         sector_lines = "N/A"
 
+    # Add RS data to prompt
+    rs_lines = ""
+    try:
+        _rs = fetch_relative_strength()
+        tsla_rs = _rs.get("TSLA",{})
+        qqq_p   = _rs.get("_qqq_pct")
+        if tsla_rs.get("rs") is not None:
+            rs_lines = (
+                f"TSLA今日RS vs QQQ: {tsla_rs['rs']:+.2f}% "
+                f"({'跑贏' if tsla_rs['rs']>0 else '跑輸'}) | "
+                f"5日均RS: {tsla_rs.get('rs_5d',0):+.2f}% | "
+                f"20日均RS: {tsla_rs.get('rs_20d',0):+.2f}% | "
+                f"QQQ今日: {fmt_pct(qqq_p)}"
+            )
+    except Exception:
+        rs_lines = "N/A"
+
+    # Add P/C data to prompt
+    pc_lines = ""
+    try:
+        _pc = fetch_put_call_ratio(["TSLA","SPY"])
+        tsla_pc = _pc.get("TSLA",{})
+        spy_pc  = _pc.get("SPY",{})
+        if not tsla_pc.get("error") and tsla_pc.get("pc_ratio"):
+            pc_lines = (
+                f"TSLA P/C(Vol)={tsla_pc['pc_ratio']:.2f} "
+                f"OI={tsla_pc.get('pc_oi_all','—'):.2f if isinstance(tsla_pc.get('pc_oi_all'),float) else '—'} | "
+                f"SPY P/C(Vol)={spy_pc.get('pc_ratio','—'):.2f if isinstance(spy_pc.get('pc_ratio'),float) else '—'}"
+            )
+    except Exception:
+        pc_lines = "N/A"
+
     # Add TSLA tech data to prompt if available
     tech_lines = ""
     try:
@@ -1900,6 +2358,8 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
 | Brent 原油 | {brent_str} |
 | 美債殖利率 | {yield_lines} |
 | 板塊輪動 | {sector_lines} |
+| 相對強弱 | {rs_lines} |
+| Put/Call | {pc_lines} |
 | TSLA技術 | {tech_lines} |
 
 ## 請幫我分析：
@@ -2009,6 +2469,8 @@ def main():
 
         st.markdown("---")
         st.markdown("### 顯示選項")
+        show_rs      = st.checkbox("TSLA相對強弱",   value=True)
+        show_pc      = st.checkbox("Put/Call Ratio", value=True)
         show_tech    = st.checkbox("TSLA技術分析",   value=True)
         show_futures = st.checkbox("期貨代理",      value=True)
         show_vix     = st.checkbox("波動/恐慌",     value=True)
@@ -2215,6 +2677,14 @@ function onSuccess() {{
             "中美貿易 · 台灣局勢",
             f"US China trade tariff Taiwan semiconductor TSLA Shanghai {_today}",
             sk, gk, "🌏")
+
+    # ── TSLA Relative Strength ───────────────────────────────────────────────
+    if show_rs:
+        render_relative_strength()
+
+    # ── Put/Call Ratio ────────────────────────────────────────────────────────
+    if show_pc:
+        render_put_call_panel()
 
     # ── TSLA Technical Panel ─────────────────────────────────────────────────
     tech_result = None
